@@ -186,3 +186,68 @@ func TestRedisSearch(t *testing.T) {
 		t.Errorf("after drop HasCollection = %v, %v; want false, nil", ok, err)
 	}
 }
+
+func TestRedisHybridSearch(t *testing.T) {
+	db := redisTestDB(t)
+	ctx := context.Background()
+	const col = "raggo_test_hybrid"
+	setupRedisDocs(t, db, col)
+	defer db.DropCollection(ctx, col)
+
+	q := map[string]Vector{"Embedding": {1, 0.1, 0, 0}} // nearest: golang doc
+	for _, combine := range []string{"RRF", "LINEAR"} {
+		// Review focus 3: "?" must not reach Redis query syntax.
+		res, err := db.HybridSearch(ctx, col, q, 3, "COSINE",
+			map[string]interface{}{"query_text": "sourdough bread?", "combine": combine, "ef": 64}, nil)
+		must(t, err)
+		texts := map[interface{}]bool{}
+		for _, r := range res {
+			texts[r.Fields["Text"]] = true
+		}
+		if !texts["golang channels and goroutines"] || !texts["baking sourdough bread"] {
+			t.Errorf("%s: results %+v, want both the vector hit and the text hit", combine, res)
+		}
+		// Review focus 4: RRF scores are normalized into (0,1].
+		if combine == "RRF" && (res[0].Score <= 0 || res[0].Score > 1+1e-9) { // epsilon: float sum of 1/(k+r)
+			t.Errorf("RRF top score %v not in (0,1]", res[0].Score)
+		}
+	}
+
+	// No query text: the vector ranking alone decides.
+	res, err := db.HybridSearch(ctx, col, q, 1, "COSINE", nil, nil)
+	must(t, err)
+	if len(res) != 1 || res[0].Fields["Text"] != "golang channels and goroutines" {
+		t.Errorf("text-less hybrid = %+v, want golang doc", res)
+	}
+}
+
+func TestRedisHybridMultiVector(t *testing.T) {
+	db := redisTestDB(t)
+	ctx := context.Background()
+	const col = "raggo_test_multivec"
+	if ok, _ := db.HasCollection(ctx, col); ok {
+		must(t, db.DropCollection(ctx, col))
+	}
+	defer db.DropCollection(ctx, col)
+	must(t, db.CreateCollection(ctx, col, Schema{Name: col, Fields: []Field{
+		{Name: "ID", DataType: "int64", PrimaryKey: true, AutoID: true},
+		{Name: "A", DataType: "float_vector", Dimension: 2},
+		{Name: "B", DataType: "float_vector", Dimension: 2},
+		{Name: "Text", DataType: "varchar", MaxLength: 1024},
+	}}))
+	idx := Index{Type: "HNSW", Metric: "COSINE"}
+	must(t, db.CreateIndex(ctx, col, "A", idx))
+	must(t, db.CreateIndex(ctx, col, "B", idx)) // no-op: index already covers B
+	must(t, db.Insert(ctx, col, []Record{
+		{Fields: map[string]interface{}{"A": []float64{1, 0}, "B": []float64{1, 0}, "Text": "both match"}},
+		{Fields: map[string]interface{}{"A": []float64{1, 0}, "B": []float64{0, 1}, "Text": "only A matches"}},
+		{Fields: map[string]interface{}{"A": []float64{0, 1}, "B": []float64{0, 1}, "Text": "neither matches"}},
+	}))
+	db.SetColumnNames([]string{"Text"})
+
+	res, err := db.HybridSearch(ctx, col, map[string]Vector{"A": {1, 0}, "B": {1, 0}}, 2, "COSINE", nil, nil)
+	must(t, err)
+	if len(res) != 2 || res[0].Fields["Text"] != "both match" {
+		t.Errorf("multi-vector hybrid = %+v, want 'both match' first, 2 results", res)
+	}
+}

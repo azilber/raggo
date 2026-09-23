@@ -417,7 +417,125 @@ func (r *RedisDB) Search(ctx context.Context, collectionName string, vectors map
 	return results, nil
 }
 
-// HybridSearch is implemented in Task 3.
+// HybridSearch fuses BM25 text search on Text with vector KNN using FT.HYBRID.
+// The query text comes from searchParams["query_text"]; without it only the vector
+// ranking counts. Fusion: searchParams["combine"] = "RRF" (default) or "LINEAR"
+// with optional "alpha"/"beta" weights. FT.HYBRID takes one vector field, so
+// several fields run one FT.HYBRID each (pipelined) and are merged with RRF.
 func (r *RedisDB) HybridSearch(ctx context.Context, collectionName string, vectors map[string]Vector, topK int, metricType string, searchParams map[string]interface{}, reranker interface{}) ([]SearchResult, error) {
-	return nil, fmt.Errorf("redis hybrid search not implemented")
+	if reranker != nil {
+		return nil, fmt.Errorf("redis fuses inside FT.HYBRID; set searchParams[\"combine\"] instead of passing a reranker")
+	}
+	if len(vectors) == 0 {
+		return nil, fmt.Errorf("hybrid search needs at least one vector")
+	}
+	if topK <= 0 {
+		return nil, fmt.Errorf("topK must be positive, got %d", topK)
+	}
+	text, _ := searchParams["query_text"].(string)
+	combine, _ := searchParams["combine"].(string)
+	linear := strings.EqualFold(combine, "LINEAR")
+	cols := r.columns()
+
+	pipe := r.client.Pipeline()
+	cmds := make([]*redis.Cmd, 0, len(vectors))
+	for field, vec := range vectors {
+		if err := validName("field", field); err != nil {
+			return nil, err
+		}
+		cmds = append(cmds, pipe.Do(ctx, hybridArgs(collectionName, textQuery(text), field, vec, topK, linear, searchParams, cols)...))
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return nil, fmt.Errorf("redis FT.HYBRID %s: %w", collectionName, err)
+	}
+
+	lists := make([][]SearchResult, len(cmds))
+	for i, cmd := range cmds {
+		list, err := parseHybrid(cmd.Val(), cols)
+		if err != nil {
+			return nil, err
+		}
+		if !linear { // FT.HYBRID RRF fuses 2 lists (text, vector): max 2/(k+1). Scale into [0,1].
+			for j := range list {
+				list[j].Score *= (rrfK + 1) / 2
+			}
+		}
+		lists[i] = list
+	}
+	if len(lists) == 1 {
+		return lists[0], nil
+	}
+	return fuseRRF(lists, topK), nil
+}
+
+// hybridArgs builds one FT.HYBRID command (syntax: redis.io/docs/latest/commands/ft.hybrid).
+func hybridArgs(index, query, field string, vec Vector, topK int, linear bool, params map[string]interface{}, cols []string) []interface{} {
+	window := max(topK, 20) // 20 is Redis's default fusion window
+	args := []interface{}{"FT.HYBRID", index,
+		"SEARCH", query,
+		"VSIM", "@" + field, "$vec", "KNN", 4, "K", topK, "EF_RUNTIME", efRuntime(params)}
+	if linear {
+		alpha, ok := params["alpha"].(float64)
+		if !ok {
+			alpha = 0.5
+		}
+		beta, ok := params["beta"].(float64)
+		if !ok {
+			beta = 0.5
+		}
+		args = append(args, "COMBINE", "LINEAR", 6, "ALPHA", alpha, "BETA", beta, "WINDOW", window)
+	} else {
+		args = append(args, "COMBINE", "RRF", 4, "CONSTANT", rrfK, "WINDOW", window)
+	}
+	args = append(args, "LIMIT", 0, topK, "LOAD", len(cols)+2, "@__key", "@__score")
+	for _, c := range cols {
+		args = append(args, "@"+c)
+	}
+	return append(args, "PARAMS", 2, "vec", float32Bytes(vec))
+}
+
+// toMap reads a RESP2 flat key/value array or a RESP3 map.
+func toMap(v interface{}) map[string]interface{} {
+	out := make(map[string]interface{})
+	switch x := v.(type) {
+	case []interface{}:
+		for i := 0; i+1 < len(x); i += 2 {
+			out[fmt.Sprint(x[i])] = x[i+1]
+		}
+	case map[interface{}]interface{}:
+		for k, val := range x {
+			out[fmt.Sprint(k)] = val
+		}
+	}
+	return out
+}
+
+// parseHybrid converts an FT.HYBRID reply ({total_results, results: [{__key, __score, fields...}], ...}).
+// A row missing __key or __score is an error, not a silent ID 0 / score 0.
+func parseHybrid(reply interface{}, cols []string) ([]SearchResult, error) {
+	rows, ok := toMap(reply)["results"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected FT.HYBRID reply: %v", reply)
+	}
+	results := make([]SearchResult, 0, len(rows))
+	for _, row := range rows {
+		m := toMap(row)
+		key, hasKey := m["__key"]
+		rawScore, hasScore := m["__score"]
+		if !hasKey || !hasScore {
+			return nil, fmt.Errorf("FT.HYBRID row missing __key/__score: %v", m)
+		}
+		score, err := strconv.ParseFloat(fmt.Sprint(rawScore), 64)
+		if err != nil {
+			return nil, fmt.Errorf("FT.HYBRID bad score %v: %w", rawScore, err)
+		}
+		fields := make(map[string]interface{}, len(cols))
+		for _, c := range cols {
+			if v, ok := m[c]; ok {
+				fields[c] = v
+			}
+		}
+		results = append(results, SearchResult{ID: keyID(fmt.Sprint(key)), Score: score, Fields: fields})
+	}
+	return results, nil
 }
