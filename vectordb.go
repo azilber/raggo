@@ -44,6 +44,7 @@ type Option func(*Config)
 // - "milvus": Production-grade vector database
 // - "memory": In-memory database for testing
 // - "chromem": Chrome-based persistent storage
+// - "redis": Redis 8.4+ Query Engine (vector + FT.HYBRID)
 func WithType(dbType string) Option {
 	return func(c *Config) {
 		c.Type = dbType
@@ -55,6 +56,7 @@ func WithType(dbType string) Option {
 // - Milvus: "localhost:19530"
 // - Memory: "" (no address needed)
 // - ChromeM: "./data/vectors.db"
+// - Redis: "localhost:6379" or "redis://user:pass@host:6379/0"
 func WithAddress(address string) Option {
 	return func(c *Config) {
 		c.Address = address
