@@ -213,15 +213,14 @@ func (r *RedisDB) HasCollection(ctx context.Context, name string) (bool, error) 
 	return false, err
 }
 
-// DropCollection removes the index, every document hash, and the ID counter.
+// DropCollection removes the index and every indexed document hash. The ID
+// counter is kept on purpose: FT.DROPINDEX DD leaves unindexed hashes behind,
+// and a recreated collection that restarted at ID 1 would HSET onto them.
 func (r *RedisDB) DropCollection(ctx context.Context, name string) error {
 	r.mu.Lock()
 	delete(r.schemas, name)
 	r.mu.Unlock()
-	if err := r.client.FTDropIndexWithArgs(ctx, name, &redis.FTDropIndexOptions{DeleteDocs: true}).Err(); err != nil {
-		return err
-	}
-	return r.client.Del(ctx, idCounterKey(name)).Err()
+	return r.client.FTDropIndexWithArgs(ctx, name, &redis.FTDropIndexOptions{DeleteDocs: true}).Err()
 }
 
 // CreateCollection records the schema; the FT index is built by CreateIndex,
@@ -293,6 +292,49 @@ func (r *RedisDB) CreateIndex(ctx context.Context, collectionName, field string,
 	return nil
 }
 
+// vectorDims returns each vector field's DIM: from the schema this process
+// recorded, or (after a restart) from FT.INFO, cached for later inserts.
+// No index yet means no dims to check.
+func (r *RedisDB) vectorDims(ctx context.Context, collection string) (map[string]int, error) {
+	schema, ok := r.schema(collection)
+	if !ok {
+		reply, err := r.client.Do(ctx, "FT.INFO", collection).Result()
+		if err != nil {
+			if msg := strings.ToLower(err.Error()); strings.Contains(msg, "unknown index") || strings.Contains(msg, "no such index") {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("redis FT.INFO %s: %w", collection, err)
+		}
+		attrs, _ := toMap(reply)["attributes"].([]interface{})
+		for _, a := range attrs {
+			m := toMap(a)
+			if fmt.Sprint(m["type"]) != "VECTOR" {
+				continue
+			}
+			dim, ok := m["dim"].(int64)
+			if !ok {
+				return nil, fmt.Errorf("redis FT.INFO %s: vector field %v has no integer dim", collection, m["attribute"])
+			}
+			schema.Fields = append(schema.Fields, Field{Name: fmt.Sprint(m["attribute"]), DataType: "float_vector", Dimension: int(dim)})
+		}
+		r.mu.Lock()
+		if _, raced := r.schemas[collection]; !raced { // don't clobber a full schema from CreateCollection
+			if r.schemas == nil {
+				r.schemas = make(map[string]Schema)
+			}
+			r.schemas[collection] = schema
+		}
+		r.mu.Unlock()
+	}
+	dims := make(map[string]int)
+	for _, f := range schema.Fields {
+		if f.DataType == "float_vector" {
+			dims[f.Name] = f.Dimension
+		}
+	}
+	return dims, nil
+}
+
 // insertBatch caps records per MULTI/EXEC: Redis is single-threaded, and one EXEC
 // with thousands of 6KB vectors would stall every other client.
 const insertBatch = 500
@@ -304,13 +346,9 @@ func (r *RedisDB) Insert(ctx context.Context, collectionName string, data []Reco
 		return nil
 	}
 	// Redis silently skips indexing a hash whose vector has the wrong size, so check it here.
-	// ponytail: dims known only for schemas this process created; read FT.INFO if restarts must be checked too.
-	dims := make(map[string]int)
-	schema, _ := r.schema(collectionName)
-	for _, f := range schema.Fields {
-		if f.DataType == "float_vector" {
-			dims[f.Name] = f.Dimension
-		}
+	dims, err := r.vectorDims(ctx, collectionName)
+	if err != nil {
+		return err
 	}
 
 	// Convert and validate everything before writing anything.
@@ -418,8 +456,8 @@ func (r *RedisDB) Search(ctx context.Context, collectionName string, vectors map
 }
 
 // HybridSearch fuses BM25 text search on Text with vector KNN using FT.HYBRID.
-// The query text comes from searchParams["query_text"]; without it only the vector
-// ranking counts. Fusion: searchParams["combine"] = "RRF" (default) or "LINEAR"
+// The query text comes from searchParams["query_text"]; when it is missing or
+// matches no document, this falls back to plain KNN (see knnOnly). Fusion: searchParams["combine"] = "RRF" (default) or "LINEAR"
 // with optional "alpha"/"beta" weights. FT.HYBRID takes one vector field, so
 // several fields run one FT.HYBRID each (pipelined) and are merged with RRF.
 func (r *RedisDB) HybridSearch(ctx context.Context, collectionName string, vectors map[string]Vector, topK int, metricType string, searchParams map[string]interface{}, reranker interface{}) ([]SearchResult, error) {
@@ -432,7 +470,22 @@ func (r *RedisDB) HybridSearch(ctx context.Context, collectionName string, vecto
 	if topK <= 0 {
 		return nil, fmt.Errorf("topK must be positive, got %d", topK)
 	}
+	for field := range vectors {
+		if err := validName("field", field); err != nil {
+			return nil, err
+		}
+	}
 	text, _ := searchParams["query_text"].(string)
+	query := textQuery(text)
+	// With no text, or text no document contains, FT.HYBRID would fuse KNN with an
+	// arbitrary text ranking and cap every score at 0.5. Rank by vectors alone instead.
+	matches, err := r.textMatches(ctx, collectionName, query)
+	if err != nil {
+		return nil, err
+	}
+	if matches == 0 {
+		return r.knnOnly(ctx, collectionName, vectors, topK, metricType, searchParams)
+	}
 	combine, _ := searchParams["combine"].(string)
 	linear := strings.EqualFold(combine, "LINEAR")
 	cols := r.columns()
@@ -440,10 +493,7 @@ func (r *RedisDB) HybridSearch(ctx context.Context, collectionName string, vecto
 	pipe := r.client.Pipeline()
 	cmds := make([]*redis.Cmd, 0, len(vectors))
 	for field, vec := range vectors {
-		if err := validName("field", field); err != nil {
-			return nil, err
-		}
-		cmds = append(cmds, pipe.Do(ctx, hybridArgs(collectionName, textQuery(text), field, vec, topK, linear, searchParams, cols)...))
+		cmds = append(cmds, pipe.Do(ctx, hybridArgs(collectionName, query, field, vec, topK, linear, searchParams, cols)...))
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		return nil, fmt.Errorf("redis FT.HYBRID %s: %w", collectionName, err)
@@ -455,12 +505,60 @@ func (r *RedisDB) HybridSearch(ctx context.Context, collectionName string, vecto
 		if err != nil {
 			return nil, err
 		}
-		if !linear { // FT.HYBRID RRF fuses 2 lists (text, vector): max 2/(k+1). Scale into [0,1].
+		if linear {
+			// LINEAR is alpha*BM25 + beta*similarity and BM25 is unbounded, so scale
+			// relative to the best hit: scores land in (0,1], the top one at 1.
+			top := 0.0
+			for _, res := range list {
+				top = math.Max(top, res.Score)
+			}
+			for j := range list {
+				if top > 0 {
+					list[j].Score /= top
+				}
+			}
+		} else { // FT.HYBRID RRF fuses 2 lists (text, vector): max 2/(k+1). Scale into [0,1].
 			for j := range list {
 				list[j].Score *= (rrfK + 1) / 2
 			}
 		}
 		lists[i] = list
+	}
+	if len(lists) == 1 {
+		return lists[0], nil
+	}
+	return fuseRRF(lists, topK), nil
+}
+
+// textMatches counts documents matching the text half of a hybrid query ("*" counts as none).
+func (r *RedisDB) textMatches(ctx context.Context, index, query string) (int64, error) {
+	if query == "*" {
+		return 0, nil
+	}
+	reply, err := r.client.Do(ctx, "FT.SEARCH", index, query, "LIMIT", 0, 0, "DIALECT", 2).Slice()
+	if err != nil {
+		return 0, fmt.Errorf("redis FT.SEARCH %s (count): %w", index, err)
+	}
+	if len(reply) == 0 {
+		return 0, fmt.Errorf("redis FT.SEARCH %s (count): empty reply", index)
+	}
+	n, ok := reply[0].(int64)
+	if !ok {
+		return 0, fmt.Errorf("redis FT.SEARCH %s (count): unexpected total %v", index, reply[0])
+	}
+	return n, nil
+}
+
+// knnOnly is hybrid search without a usable text half: plain KNN per vector
+// field, merged with RRF when there are several.
+func (r *RedisDB) knnOnly(ctx context.Context, index string, vectors map[string]Vector, topK int, metricType string, params map[string]interface{}) ([]SearchResult, error) {
+	lists := make([][]SearchResult, 0, len(vectors))
+	for field, vec := range vectors {
+		list, err := r.Search(ctx, index, map[string]Vector{field: vec}, topK, metricType, params)
+		if err != nil {
+			return nil, err
+		}
+		lists = append(lists, list)
 	}
 	if len(lists) == 1 {
 		return lists[0], nil
