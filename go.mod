@@ -1,6 +1,6 @@
 module github.com/teilomillet/raggo
 
-go 1.23.1
+go 1.24
 
 require (
 	github.com/danaugrs/go-tsne/tsne v0.0.0-20220306155740-2250969e057f
@@ -8,6 +8,7 @@ require (
 	github.com/milvus-io/milvus-sdk-go/v2 v2.4.2
 	github.com/philippgille/chromem-go v0.7.0
 	github.com/pkoukk/tiktoken-go v0.1.7
+	github.com/redis/go-redis/v9 v9.22.0
 	github.com/teilomillet/gofh v0.0.0-20240802075906-9ed4e405f11a
 	github.com/teilomillet/gollm v0.1.1
 	golang.org/x/time v0.8.0
@@ -18,6 +19,7 @@ require (
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/buger/jsonparser v1.1.1 // indirect
 	github.com/caarlos0/env/v11 v11.2.2 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cockroachdb/errors v1.11.3 // indirect
 	github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b // indirect
 	github.com/cockroachdb/redact v1.1.5 // indirect
@@ -47,6 +49,7 @@ require (
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/wk8/go-ordered-map/v2 v2.1.8 // indirect
+	go.uber.org/atomic v1.11.0 // indirect
 	golang.org/x/crypto v0.35.0 // indirect
 	golang.org/x/net v0.31.0 // indirect
 	golang.org/x/sync v0.11.0 // indirect
