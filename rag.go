@@ -228,6 +228,13 @@ func SetDBAddress(address string) RAGOption {
 	}
 }
 
+// SetDBType selects the vector database backend ("milvus", "redis", "memory", "chromem").
+func SetDBType(dbType string) RAGOption {
+	return func(c *RAGConfig) {
+		c.DBType = dbType
+	}
+}
+
 // SetChunkSize configures the size of text chunks in tokens.
 // Larger chunks provide more context but may reduce retrieval precision.
 //
@@ -340,6 +347,19 @@ func WithMilvus(collection string) RAGOption {
 	return func(c *RAGConfig) {
 		c.DBType = "milvus"
 		c.DBAddress = "localhost:19530"
+		c.Collection = collection
+	}
+}
+
+// WithRedis configures Redis (8.4+) as the vector database with the specified collection.
+//
+//	rag, err := raggo.NewRAG(
+//	    raggo.WithRedis("my_documents"),
+//	)
+func WithRedis(collection string) RAGOption {
+	return func(c *RAGConfig) {
+		c.DBType = "redis"
+		c.DBAddress = "localhost:6379"
 		c.Collection = collection
 	}
 }
