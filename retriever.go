@@ -139,7 +139,7 @@ func (r *Retriever) Retrieve(ctx context.Context, query string) ([]RetrieverResu
 			vectors,
 			r.config.TopK,
 			r.config.MetricType,
-			r.config.SearchParams,
+			withQueryText(r.config.SearchParams, query),
 			nil,
 		)
 	} else {
@@ -404,4 +404,15 @@ func (r *Retriever) Close() error {
 		return r.vectorDB.Close()
 	}
 	return nil
+}
+
+// withQueryText copies params and adds the raw query for backends whose hybrid
+// search needs the text (Redis FT.HYBRID); other backends ignore the key.
+func withQueryText(params map[string]interface{}, query string) map[string]interface{} {
+	out := make(map[string]interface{}, len(params)+1)
+	for k, v := range params {
+		out[k] = v
+	}
+	out["query_text"] = query
+	return out
 }
