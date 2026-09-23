@@ -90,6 +90,12 @@ type ContextualRAGConfig struct {
 	// MinScore sets the minimum similarity threshold for retrieval
 	// Higher values increase precision but may reduce recall
 	MinScore float64
+
+	// DBType selects the vector database ("milvus" or "redis")
+	DBType string
+
+	// DBAddress is the vector database address (e.g., "localhost:19530", "localhost:6379")
+	DBAddress string
 }
 
 // DefaultContextualConfig returns a balanced configuration suitable for
@@ -107,6 +113,8 @@ func DefaultContextualConfig() ContextualRAGConfig {
 		ChunkOverlap: 50,     // 25% overlap for context
 		TopK:         10,     // Reasonable number of results
 		MinScore:     0.0,    // No minimum for flexible matching
+		DBType:       "milvus",
+		DBAddress:    "localhost:19530",
 	}
 }
 
@@ -160,6 +168,12 @@ func NewContextualRAG(config *ContextualRAGConfig) (*ContextualRAG, error) {
 		if config.MinScore == 0 {
 			config.MinScore = defaultConfig.MinScore
 		}
+		if config.DBType == "" {
+			config.DBType = defaultConfig.DBType
+		}
+		if config.DBAddress == "" {
+			config.DBAddress = defaultConfig.DBAddress
+		}
 	}
 
 	// Try to get API key from env if not set
@@ -204,8 +218,8 @@ func NewDefaultContextualRAG(collection string) (*ContextualRAG, error) {
 func initializeRAG(config *ContextualRAGConfig) (*ContextualRAG, error) {
 	// Initialize vector database
 	vectorDB, err := NewVectorDB(
-		WithType("milvus"),
-		WithAddress("localhost:19530"),
+		WithType(config.DBType),
+		WithAddress(config.DBAddress),
 		WithTimeout(5*time.Minute),
 	)
 	if err != nil {
@@ -251,7 +265,9 @@ func initializeRAG(config *ContextualRAGConfig) (*ContextualRAG, error) {
 	// Initialize RAG with basic settings
 	ragOpts := []RAGOption{
 		WithOpenAI(config.APIKey),
-		WithMilvus(config.Collection),
+		SetDBType(config.DBType),
+		SetDBAddress(config.DBAddress),
+		SetCollection(config.Collection),
 	}
 
 	rag, err := NewRAG(ragOpts...)
@@ -261,7 +277,7 @@ func initializeRAG(config *ContextualRAGConfig) (*ContextualRAG, error) {
 
 	// Initialize Retriever with functional options
 	retriever, err := NewRetriever(
-		WithRetrieveDB("milvus", "localhost:19530"),
+		WithRetrieveDB(config.DBType, config.DBAddress),
 		WithRetrieveCollection(config.Collection),
 		WithTopK(config.TopK),
 		WithMinScore(config.MinScore),
