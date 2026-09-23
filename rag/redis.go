@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,7 +26,7 @@ const rrfK = 60.0
 type RedisDB struct {
 	client      *redis.Client
 	config      *Config
-	mu          sync.RWMutex      // guards columnNames and schemas, as in MemoryDB (callers Insert from goroutines)
+	mu          sync.RWMutex // guards columnNames and schemas, as in MemoryDB (callers Insert from goroutines)
 	columnNames []string
 	schemas     map[string]Schema // FT.CREATE needs the metric, which only arrives with CreateIndex
 }
@@ -195,4 +196,228 @@ func efRuntime(params map[string]interface{}) int {
 		return ef
 	}
 	return 10 // Redis default EF_RUNTIME
+}
+
+// idCounterKey holds the AutoID counter. It's a string key, so the hash-only index ignores it.
+func idCounterKey(collection string) string { return "raggo:id:" + collection }
+
+// HasCollection reports whether the collection's FT index exists.
+func (r *RedisDB) HasCollection(ctx context.Context, name string) (bool, error) {
+	err := r.client.Do(ctx, "FT.INFO", name).Err()
+	if err == nil {
+		return true, nil
+	}
+	if msg := strings.ToLower(err.Error()); strings.Contains(msg, "unknown index") || strings.Contains(msg, "no such index") {
+		return false, nil
+	}
+	return false, err
+}
+
+// DropCollection removes the index, every document hash, and the ID counter.
+func (r *RedisDB) DropCollection(ctx context.Context, name string) error {
+	r.mu.Lock()
+	delete(r.schemas, name)
+	r.mu.Unlock()
+	if err := r.client.FTDropIndexWithArgs(ctx, name, &redis.FTDropIndexOptions{DeleteDocs: true}).Err(); err != nil {
+		return err
+	}
+	return r.client.Del(ctx, idCounterKey(name)).Err()
+}
+
+// CreateCollection records the schema; the FT index is built by CreateIndex,
+// because Redis takes the vector metric and HNSW parameters in the same command.
+func (r *RedisDB) CreateCollection(ctx context.Context, name string, schema Schema) error {
+	schema.Fields = slices.Clone(schema.Fields) // don't alias the caller's slice
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.schemas == nil { // zero-value RedisDB stays usable
+		r.schemas = make(map[string]Schema)
+	}
+	r.schemas[name] = schema
+	return nil
+}
+
+// CreateIndex issues FT.CREATE over "<collection>:" hashes. It is a no-op when
+// the index already exists (a second vector field, or a restarted process).
+// ponytail: every vector field shares this call's metric and HNSW params; per-field metrics if a schema ever mixes them.
+func (r *RedisDB) CreateIndex(ctx context.Context, collectionName, field string, index Index) error {
+	if err := validName("collection", collectionName); err != nil {
+		return err
+	}
+	exists, err := r.HasCollection(ctx, collectionName)
+	if err != nil || exists {
+		return err
+	}
+	schema, ok := r.schema(collectionName)
+	if !ok {
+		return fmt.Errorf("collection %s has no schema: call CreateCollection first", collectionName)
+	}
+	if index.Type != "HNSW" {
+		return fmt.Errorf("unsupported index type: %s", index.Type)
+	}
+	m, _ := index.Parameters["M"].(int)
+	efc, _ := index.Parameters["efConstruction"].(int)
+
+	var fields []*redis.FieldSchema
+	for _, f := range schema.Fields {
+		switch f.DataType {
+		case "float_vector":
+			if err := validName("field", f.Name); err != nil {
+				return err
+			}
+			fields = append(fields, &redis.FieldSchema{
+				FieldName: f.Name,
+				FieldType: redis.SearchFieldTypeVector,
+				VectorArgs: &redis.FTVectorArgs{HNSWOptions: &redis.FTHNSWOptions{
+					Type:                   "FLOAT32",
+					Dim:                    f.Dimension,
+					DistanceMetric:         redisMetric(index.Metric),
+					MaxEdgesPerNode:        m,   // M
+					MaxAllowedEdgesPerNode: efc, // EF_CONSTRUCTION
+				}},
+			})
+		case "varchar":
+			if f.Name == "Text" { // the only field textQuery searches
+				fields = append(fields, &redis.FieldSchema{FieldName: f.Name, FieldType: redis.SearchFieldTypeText})
+			}
+		}
+		// Other varchars (Metadata JSON) and the int64 AutoID key are stored in the hash
+		// and returned by RETURN/LOAD, but not indexed: nothing queries them.
+	}
+	GlobalLogger.Debug("Creating Redis index", "name", collectionName, "fields", len(fields))
+	if err := r.client.FTCreate(ctx, collectionName,
+		&redis.FTCreateOptions{OnHash: true, Prefix: []interface{}{collectionName + ":"}},
+		fields...).Err(); err != nil {
+		return fmt.Errorf("redis FT.CREATE %s: %w", collectionName, err)
+	}
+	return nil
+}
+
+// insertBatch caps records per MULTI/EXEC: Redis is single-threaded, and one EXEC
+// with thousands of 6KB vectors would stall every other client.
+const insertBatch = 500
+
+// Insert writes each record as a hash at "<collection>:<id>", reserving IDs
+// with one INCRBY (AutoID parity with Milvus) and writing HSETs in atomic batches.
+func (r *RedisDB) Insert(ctx context.Context, collectionName string, data []Record) error {
+	if len(data) == 0 {
+		return nil
+	}
+	// Redis silently skips indexing a hash whose vector has the wrong size, so check it here.
+	// ponytail: dims known only for schemas this process created; read FT.INFO if restarts must be checked too.
+	dims := make(map[string]int)
+	schema, _ := r.schema(collectionName)
+	for _, f := range schema.Fields {
+		if f.DataType == "float_vector" {
+			dims[f.Name] = f.Dimension
+		}
+	}
+
+	// Convert and validate everything before writing anything.
+	hashes := make([][]interface{}, len(data))
+	for i, rec := range data {
+		values := make([]interface{}, 0, 2*len(rec.Fields))
+		for name, v := range rec.Fields {
+			val, err := redisValue(v)
+			if err != nil {
+				return fmt.Errorf("record %d field %s: %w", i, name, err)
+			}
+			if want, ok := dims[name]; ok {
+				if b, _ := val.([]byte); len(b) != 4*want {
+					return fmt.Errorf("record %d field %s: vector has %d dimensions, index expects %d", i, name, len(b)/4, want)
+				}
+			}
+			values = append(values, name, val)
+		}
+		hashes[i] = values
+	}
+
+	last, err := r.client.IncrBy(ctx, idCounterKey(collectionName), int64(len(data))).Result()
+	if err != nil {
+		return fmt.Errorf("redis reserve ids for %s: %w", collectionName, err)
+	}
+	first := last - int64(len(data)) + 1
+
+	for start := 0; start < len(hashes); start += insertBatch {
+		end := min(start+insertBatch, len(hashes))
+		pipe := r.client.TxPipeline() // MULTI/EXEC: each batch lands whole or not at all
+		for i := start; i < end; i++ {
+			pipe.HSet(ctx, fmt.Sprintf("%s:%d", collectionName, first+int64(i)), hashes[i]...)
+		}
+		if _, err := pipe.Exec(ctx); err != nil {
+			GlobalLogger.Error("Failed to insert data", "collection", collectionName, "error", err)
+			return fmt.Errorf("redis insert into %s (records %d-%d; earlier batches were written): %w", collectionName, start, end-1, err)
+		}
+	}
+	return nil
+}
+
+// Flush is a no-op: Redis indexes writes synchronously.
+func (r *RedisDB) Flush(ctx context.Context, collectionName string) error { return nil }
+
+// LoadCollection is a no-op: Redis keeps indexes in memory.
+func (r *RedisDB) LoadCollection(ctx context.Context, name string) error { return nil }
+
+// SetColumnNames sets the list of fields to return in search results.
+func (r *RedisDB) SetColumnNames(names []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.columnNames = slices.Clone(names) // caller may reuse its slice
+}
+
+// Search runs a KNN query on the single vector field in vectors.
+func (r *RedisDB) Search(ctx context.Context, collectionName string, vectors map[string]Vector, topK int, metricType string, searchParams map[string]interface{}) ([]SearchResult, error) {
+	if len(vectors) != 1 {
+		return nil, fmt.Errorf("redis search takes exactly one vector field, got %d", len(vectors))
+	}
+	if topK <= 0 {
+		return nil, fmt.Errorf("topK must be positive, got %d", topK)
+	}
+	var field string
+	var vec Vector
+	for f, v := range vectors {
+		field, vec = f, v
+	}
+	if err := validName("field", field); err != nil {
+		return nil, err
+	}
+
+	cols := r.columns()
+	returns := []redis.FTSearchReturn{{FieldName: "__dist"}}
+	for _, c := range cols {
+		returns = append(returns, redis.FTSearchReturn{FieldName: c})
+	}
+	res, err := r.client.FTSearchWithArgs(ctx, collectionName,
+		fmt.Sprintf("*=>[KNN $K @%s $vec EF_RUNTIME $EF AS __dist]", field),
+		&redis.FTSearchOptions{
+			Params:         map[string]interface{}{"K": topK, "EF": efRuntime(searchParams), "vec": float32Bytes(vec)},
+			DialectVersion: 2,
+			Return:         returns,
+			SortBy:         []redis.FTSearchSortBy{{FieldName: "__dist", Asc: true}},
+			Limit:          topK,
+		}).Result()
+	if err != nil {
+		return nil, fmt.Errorf("redis FT.SEARCH %s: %w", collectionName, err)
+	}
+
+	results := make([]SearchResult, 0, len(res.Docs))
+	for _, doc := range res.Docs {
+		dist, err := strconv.ParseFloat(doc.Fields["__dist"], 64)
+		if err != nil {
+			return nil, fmt.Errorf("doc %s: bad distance %q: %w", doc.ID, doc.Fields["__dist"], err)
+		}
+		fields := make(map[string]interface{}, len(cols))
+		for _, c := range cols {
+			if v, ok := doc.Fields[c]; ok {
+				fields[c] = v
+			}
+		}
+		results = append(results, SearchResult{ID: keyID(doc.ID), Score: distToScore(dist, metricType), Fields: fields})
+	}
+	return results, nil
+}
+
+// HybridSearch is implemented in Task 3.
+func (r *RedisDB) HybridSearch(ctx context.Context, collectionName string, vectors map[string]Vector, topK int, metricType string, searchParams map[string]interface{}, reranker interface{}) ([]SearchResult, error) {
+	return nil, fmt.Errorf("redis hybrid search not implemented")
 }

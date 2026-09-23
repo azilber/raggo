@@ -161,6 +161,8 @@ func NewVectorDB(cfg *Config) (VectorDB, error) {
 		return newMemoryDB(cfg)
 	case "chromem":
 		return newChromemDB(cfg)
+	case "redis":
+		return newRedisDB(cfg)
 	default:
 		return nil, fmt.Errorf("unsupported database type: %s", cfg.Type)
 	}
