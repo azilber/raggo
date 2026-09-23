@@ -802,7 +802,7 @@ func (r *RAG) hybridSearch(ctx context.Context, query string) ([]RetrieverResult
 		vectors,
 		r.config.TopK,
 		r.config.IndexMetric,
-		r.config.SearchParams, // Use the config's search params
+		withQueryText(r.config.SearchParams, query),
 		nil,
 	)
 	if err != nil {
