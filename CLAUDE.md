@@ -13,7 +13,7 @@ go run examples/full_process.go     # loose files in examples/ are each a separa
 
 - Don't run `go build ./...` / `go vet ./...`. Every loose file in `examples/` declares `package main` in one directory, so they clash. Build or run them one file at a time.
 - Unit tests: `go test -race . ./rag/...`. Single test: `go test ./rag -run TestName -v`.
-- Redis integration tests skip unless `REDIS_ADDR` is set: `docker run -d --rm -p 6379:6379 --name raggo-redis redis:8.4`, then `REDIS_ADDR=localhost:6379 go test -race ./rag -run TestRedis -v`.
+- Redis integration tests are behind the `integration` build tag and need `REDIS_ADDR`: `docker run -d --rm -p 6379:6379 --name raggo-redis redis:8.4`, then `REDIS_ADDR=localhost:6379 go test -tags=integration -race ./rag -run TestRedis -v`.
 - End-to-end RAG test (Gemini embeddings + generation on Redis) is behind a build tag: `REDIS_ADDR=localhost:6379 GEMINI_API_KEY=... go test -tags=integration -run TestGeminiRAG -v .`
 - Most examples and all LLM or embedding paths need `OPENAI_API_KEY`. The Milvus-backed paths need a Milvus server at `localhost:19530`.
 
