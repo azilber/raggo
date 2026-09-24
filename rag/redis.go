@@ -205,6 +205,29 @@ func efRuntime(params map[string]interface{}) int {
 	return 10 // Redis default EF_RUNTIME
 }
 
+// floatParam reads a numeric searchParam given as any Go number type. Absent
+// means def; any other type is an error rather than a silent fallback.
+func floatParam(params map[string]interface{}, key string, def float64) (float64, error) {
+	v, ok := params[key]
+	if !ok {
+		return def, nil
+	}
+	switch x := v.(type) {
+	case float64:
+		return x, nil
+	case float32:
+		return float64(x), nil
+	case int:
+		return float64(x), nil
+	case int32:
+		return float64(x), nil
+	case int64:
+		return float64(x), nil
+	default:
+		return 0, fmt.Errorf("searchParams[%q] must be a number, got %T", key, v)
+	}
+}
+
 // idCounterKey holds the AutoID counter. It's a string key, so the hash-only index ignores it.
 func idCounterKey(collection string) string { return "raggo:id:" + collection }
 
@@ -469,7 +492,7 @@ func (r *RedisDB) Search(ctx context.Context, collectionName string, vectors map
 // HybridSearch fuses BM25 text search on Text with vector KNN using FT.HYBRID.
 // The query text comes from searchParams["query_text"]; when it is missing or
 // matches no document, this falls back to plain KNN (see knnOnly). Fusion: searchParams["combine"] = "RRF" (default) or "LINEAR"
-// with optional "alpha"/"beta" weights. FT.HYBRID takes one vector field, so
+// with optional numeric "alpha"/"beta" weights (default 0.5 each). FT.HYBRID takes one vector field, so
 // several fields run one FT.HYBRID each (pipelined) and are merged with RRF.
 func (r *RedisDB) HybridSearch(ctx context.Context, collectionName string, vectors map[string]Vector, topK int, metricType string, searchParams map[string]interface{}, reranker interface{}) ([]SearchResult, error) {
 	if reranker != nil {
@@ -486,6 +509,16 @@ func (r *RedisDB) HybridSearch(ctx context.Context, collectionName string, vecto
 			return nil, err
 		}
 	}
+	combine, _ := searchParams["combine"].(string)
+	linear := strings.EqualFold(combine, "LINEAR")
+	alpha, err := floatParam(searchParams, "alpha", 0.5)
+	if err != nil {
+		return nil, err
+	}
+	beta, err := floatParam(searchParams, "beta", 0.5)
+	if err != nil {
+		return nil, err
+	}
 	text, _ := searchParams["query_text"].(string)
 	query := textQuery(text)
 	// With no text, or text no document contains, FT.HYBRID would fuse KNN with an
@@ -497,14 +530,12 @@ func (r *RedisDB) HybridSearch(ctx context.Context, collectionName string, vecto
 	if matches == 0 {
 		return r.knnOnly(ctx, collectionName, vectors, topK, metricType, searchParams)
 	}
-	combine, _ := searchParams["combine"].(string)
-	linear := strings.EqualFold(combine, "LINEAR")
 	cols := r.columns()
 
 	pipe := r.client.Pipeline()
 	cmds := make([]*redis.Cmd, 0, len(vectors))
 	for field, vec := range vectors {
-		cmds = append(cmds, pipe.Do(ctx, hybridArgs(collectionName, query, field, vec, topK, linear, searchParams, cols)...))
+		cmds = append(cmds, pipe.Do(ctx, hybridArgs(collectionName, query, field, vec, topK, linear, alpha, beta, searchParams, cols)...))
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		return nil, fmt.Errorf("redis FT.HYBRID %s: %w", collectionName, err)
@@ -578,20 +609,12 @@ func (r *RedisDB) knnOnly(ctx context.Context, index string, vectors map[string]
 }
 
 // hybridArgs builds one FT.HYBRID command (syntax: redis.io/docs/latest/commands/ft.hybrid).
-func hybridArgs(index, query, field string, vec Vector, topK int, linear bool, params map[string]interface{}, cols []string) []interface{} {
+func hybridArgs(index, query, field string, vec Vector, topK int, linear bool, alpha, beta float64, params map[string]interface{}, cols []string) []interface{} {
 	window := max(topK, 20) // 20 is Redis's default fusion window
 	args := []interface{}{"FT.HYBRID", index,
 		"SEARCH", query,
 		"VSIM", "@" + field, "$vec", "KNN", 4, "K", topK, "EF_RUNTIME", efRuntime(params)}
 	if linear {
-		alpha, ok := params["alpha"].(float64)
-		if !ok {
-			alpha = 0.5
-		}
-		beta, ok := params["beta"].(float64)
-		if !ok {
-			beta = 0.5
-		}
 		args = append(args, "COMBINE", "LINEAR", 6, "ALPHA", alpha, "BETA", beta, "WINDOW", window)
 	} else {
 		args = append(args, "COMBINE", "RRF", 4, "CONSTANT", rrfK, "WINDOW", window)

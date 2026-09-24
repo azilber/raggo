@@ -61,6 +61,37 @@ func TestKeyID(t *testing.T) {
 	}
 }
 
+func TestFloatParam(t *testing.T) {
+	tests := []struct {
+		name    string
+		params  map[string]interface{}
+		want    float64
+		wantErr bool
+	}{
+		{name: "absent uses default", params: map[string]interface{}{}, want: 0.5},
+		{name: "nil map uses default", params: nil, want: 0.5},
+		{name: "float64 from JSON", params: map[string]interface{}{"alpha": 0.3}, want: 0.3},
+		{name: "float32", params: map[string]interface{}{"alpha": float32(0.25)}, want: 0.25},
+		{name: "int literal", params: map[string]interface{}{"alpha": 1}, want: 1},
+		{name: "int64", params: map[string]interface{}{"alpha": int64(2)}, want: 2},
+		{name: "string is an error", params: map[string]interface{}{"alpha": "0.3"}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := floatParam(tt.params, "alpha", 0.5)
+			if tt.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "alpha") {
+					t.Errorf("err = %v, want error naming alpha", err)
+				}
+				return
+			}
+			if err != nil || got != tt.want {
+				t.Errorf("floatParam = %v, %v; want %v, nil", got, err, tt.want)
+			}
+		})
+	}
+}
+
 func TestFuseRRF(t *testing.T) {
 	a := []SearchResult{{ID: 1}, {ID: 2}}
 	b := []SearchResult{{ID: 2}, {ID: 3}}
@@ -248,6 +279,32 @@ func TestRedisHybridSearch(t *testing.T) {
 				t.Errorf("%s score %v not in (0,1]", combine, r.Score)
 			}
 		}
+	}
+
+	// Integer weights are honoured exactly like the equal float weights (before the fix, ints fell back to 0.5).
+	// The docs don't say which half ALPHA weights, so compare int vs float instead of assuming an order.
+	linearTexts := func(alpha, beta interface{}) []interface{} {
+		t.Helper()
+		res, err := db.HybridSearch(ctx, col, q, 3, "COSINE",
+			map[string]interface{}{"query_text": "sourdough bread", "combine": "LINEAR", "alpha": alpha, "beta": beta}, nil)
+		must(t, err)
+		var out []interface{}
+		for _, r := range res {
+			out = append(out, r.Fields["Text"])
+		}
+		return out
+	}
+	ints, floats, defaults := linearTexts(0, 1), linearTexts(0.0, 1.0), linearTexts(0.5, 0.5)
+	if fmt.Sprint(ints) != fmt.Sprint(floats) {
+		t.Errorf("LINEAR int weights %v ranked differently from float weights %v", ints, floats)
+	}
+	if fmt.Sprint(ints) == fmt.Sprint(defaults) {
+		t.Logf("note: 0/1 and 0.5/0.5 rank the same here (%v); the int-vs-float check still pins the fix", ints)
+	}
+	// A non-numeric weight is an error, not a silent 0.5.
+	if _, err := db.HybridSearch(ctx, col, q, 3, "COSINE",
+		map[string]interface{}{"query_text": "bread", "combine": "LINEAR", "alpha": "0.3"}, nil); err == nil {
+		t.Error("string alpha accepted")
 	}
 
 	// No query text: the vector ranking alone decides.
