@@ -17,6 +17,7 @@ go run examples/full_process.go                          # loose files in exampl
 - Redis integration tests (`rag/redis_integration_test.go`) are behind the `integration` build tag and need `REDIS_ADDR`: `docker run -d --rm -p 6379:6379 --name raggo-redis redis:8.4`, then `REDIS_ADDR=localhost:6379 go test -tags=integration -race ./rag -run TestRedis -v`.
 - Most examples, and the default embedding and LLM paths, need `OPENAI_API_KEY`; other embedding servers work through `api_url` (see Embedding providers). The Milvus-backed paths need a Milvus server at `localhost:19530`.
 - Never write API keys (`GEMINI_API_KEY`, `OPENAI_API_KEY`) into files. Pass them through the environment only.
+- `origin` is the fork `azilber/raggo`. Open PRs with `gh pr create --repo azilber/raggo --base main`; a plain `gh pr create` targets the upstream `teilomillet/raggo`.
 
 ## End-to-end tests
 
@@ -34,7 +35,7 @@ These three are the required final check for work in this repo. They share one R
    REDIS_ADDR=localhost:6379 EMBED_URL=http://localhost:8081/v1/embeddings CHAT_URL=http://localhost:8082/v1/chat/completions go run ./examples/local_llm
    pkill -x llama-server
    ```
-3. **KoboldCpp (manual, `examples/local_llm`).** One process serves both endpoints on 5001. The binary (`koboldcpp-linux-x64`; use `koboldcpp-linux-x64-nocuda` without an NVIDIA GPU) and the GGUFs total about 1.7 GB, so download them into a scratch directory, never the repo:
+3. **KoboldCpp (manual, `examples/local_llm`).** One process serves both endpoints on 5001. The binary (`koboldcpp-linux-x64`; use `koboldcpp-linux-x64-nocuda` without an NVIDIA GPU) and the GGUFs total about 1.7 GB, so download them into a scratch directory, never the repo. The files stay in `/tmp/koboldcpp` between runs; if they're already there, skip the `gh` and `curl` lines:
    ```bash
    K=/tmp/koboldcpp && mkdir -p $K && cd $K
    gh release download --repo LostRuins/koboldcpp --pattern 'koboldcpp-linux-x64' --clobber && chmod +x koboldcpp-linux-x64
@@ -104,4 +105,4 @@ Providers register themselves in `init()` functions in `rag/providers/` (`openai
 
 ### Local LLMs
 
-[USAGE.md](USAGE.md) and `examples/local_llm` cover RAG on llama.cpp, KoboldCpp or Gemini. The example uses the building blocks rather than `RAG` for two reasons: `RAG`'s schema is fixed at 1536 dimensions while local embedding models are usually smaller, and gollm's `openai` endpoint can't be pointed at a local server. Keep USAGE.md's commands and sample output in sync with the example, because both were taken from real runs.
+[USAGE.md](USAGE.md) and `examples/local_llm` cover RAG on llama.cpp, KoboldCpp or Gemini. The example uses the building blocks rather than `RAG` for two reasons: `RAG`'s schema is fixed at 1536 dimensions while local embedding models are usually smaller, and gollm's `openai` endpoint can't be pointed at a local server. Keep USAGE.md's commands and sample output in sync with the example, because both were taken from real runs. The same goes for its CPU-only commands and its CPU vs GPU timing table: re-run and re-measure instead of hand-editing numbers. Don't claim GPU offload without evidence. Check `llama-server --list-devices` or the log's `CPU`/`CUDA0` buffer lines, because `-ngl`/`--gpulayers` alone proves nothing.
