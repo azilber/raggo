@@ -15,13 +15,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/teilomillet/raggo"
 	"github.com/teilomillet/raggo/rag/providers"
 )
@@ -126,7 +130,7 @@ func geminiAnswer(ctx context.Context, apiKey, question string, results []raggo.
 	return resp.Choices[0].Message.Content, nil
 }
 
-func dropCollection(t *testing.T, addr string) {
+func dropCollection(t *testing.T, addr, col string) {
 	t.Helper()
 	ctx := context.Background()
 	db, err := raggo.NewVectorDB(raggo.WithType("redis"), raggo.WithAddress(addr))
@@ -137,10 +141,10 @@ func dropCollection(t *testing.T, addr string) {
 	if err := db.Connect(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := db.HasCollection(ctx, itCollection); err != nil {
+	if ok, err := db.HasCollection(ctx, col); err != nil {
 		t.Fatal(err)
 	} else if ok {
-		if err := db.DropCollection(ctx, itCollection); err != nil {
+		if err := db.DropCollection(ctx, col); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -172,8 +176,8 @@ func TestGeminiRAGEndToEnd(t *testing.T) {
 		return geminiEmbedder{apiKey: apiKey, model: model}, nil
 	})
 
-	dropCollection(t, addr)
-	t.Cleanup(func() { dropCollection(t, addr) })
+	dropCollection(t, addr, itCollection)
+	t.Cleanup(func() { dropCollection(t, addr, itCollection) })
 
 	newRAG := func(t *testing.T, strategy string) *raggo.RAG {
 		t.Helper()
@@ -282,4 +286,139 @@ func TestGeminiRAGEndToEnd(t *testing.T) {
 			t.Errorf("answer does not reflect the retrieved document: %q", answer)
 		}
 	})
+}
+
+const pvQuestion = "What did the PressureValve system do during Black Friday?"
+
+func redisAddrOrSkip(t *testing.T) string {
+	t.Helper()
+	addr := os.Getenv("REDIS_ADDR")
+	if addr == "" {
+		t.Skip("set REDIS_ADDR (Redis 8.4+) to run")
+	}
+	return addr
+}
+
+// bowVector is a deterministic bag-of-words embedding: each lowercased word is
+// hashed into one of dim buckets, then the vector is L2-normalized. Texts that
+// share words score high, which makes retrieval assertions meaningful offline.
+func bowVector(text string, dim int) []float64 {
+	v := make([]float64, dim)
+	words := strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+	for _, w := range words {
+		h := fnv.New32a()
+		h.Write([]byte(w))
+		v[h.Sum32()%uint32(dim)]++
+	}
+	var norm float64
+	for _, x := range v {
+		norm += x * x
+	}
+	if norm > 0 {
+		norm = math.Sqrt(norm)
+		for i := range v {
+			v[i] /= norm
+		}
+	}
+	return v
+}
+
+// bowEmbedder serves bowVector through raggo's provider registry.
+type bowEmbedder struct{ dim int }
+
+func (b bowEmbedder) Embed(_ context.Context, text string) ([]float64, error) {
+	return bowVector(text, b.dim), nil
+}
+
+func (b bowEmbedder) GetDimension() (int, error) { return b.dim, nil }
+
+// indexDim reads the vector DIM of a collection's FT index.
+func indexDim(t *testing.T, addr, col string) int64 {
+	t.Helper()
+	c := redis.NewClient(&redis.Options{Addr: addr, Protocol: 2})
+	defer c.Close()
+	reply, err := c.Do(context.Background(), "FT.INFO", col).Slice()
+	if err != nil {
+		t.Fatalf("FT.INFO %s: %v", col, err)
+	}
+	for i := 0; i+1 < len(reply); i += 2 {
+		if reply[i] != "attributes" {
+			continue
+		}
+		attrs, _ := reply[i+1].([]interface{})
+		for _, a := range attrs {
+			kv, _ := a.([]interface{})
+			for j := 0; j+1 < len(kv); j += 2 {
+				if kv[j] == "dim" {
+					if d, ok := kv[j+1].(int64); ok {
+						return d
+					}
+				}
+			}
+		}
+	}
+	t.Fatalf("FT.INFO %s: no vector dim found", col)
+	return 0
+}
+
+func newFake1536RAG(t *testing.T, addr, col string) *raggo.RAG {
+	t.Helper()
+	providers.RegisterEmbedder("fake1536", func(map[string]interface{}) (providers.Embedder, error) {
+		return bowEmbedder{dim: 1536}, nil
+	})
+	dropCollection(t, addr, col)
+	t.Cleanup(func() { dropCollection(t, addr, col) })
+	r, err := raggo.NewRAG(
+		raggo.SetProvider("fake1536"),
+		raggo.SetAPIKey("none"),
+		raggo.SetDBType("redis"),
+		raggo.SetDBAddress(addr),
+		raggo.SetCollection(col),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.Close() })
+	return r
+}
+
+// Characterization: LoadDocuments creates a 1536-dim index and hybrid Query
+// returns the PressureValve chunk first.
+func TestRAGCharacterizeLoadAndQuery(t *testing.T) {
+	addr := redisAddrOrSkip(t)
+	ctx := t.Context() // cancelled when the test ends (Go 1.24+)
+	const col = "raggo_it_char_load"
+	r := newFake1536RAG(t, addr, col)
+
+	if err := r.LoadDocuments(ctx, "examples/chat/docs"); err != nil {
+		t.Fatalf("LoadDocuments: %v", err)
+	}
+	if d := indexDim(t, addr, col); d != 1536 {
+		t.Errorf("index dim = %d, want 1536", d)
+	}
+	res, err := r.Query(ctx, pvQuestion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) == 0 || !strings.Contains(strings.ToLower(res[0].Content), "pressurevalve") {
+		t.Errorf("top result is not the PressureValve chunk: %+v", res)
+	}
+}
+
+// Characterization: ProcessWithContext creates a 1536-dim index before it
+// parses the source, so a missing file fails after the index exists.
+func TestRAGCharacterizeProcessWithContextSchema(t *testing.T) {
+	addr := redisAddrOrSkip(t)
+	const col = "raggo_it_char_pwc"
+	r := newFake1536RAG(t, addr, col)
+
+	err := r.ProcessWithContext(t.Context(), "does-not-exist.txt", "gpt-4o-mini")
+	if err == nil || !strings.Contains(err.Error(), "failed to parse document") {
+		t.Fatalf("err = %v, want a parse error after collection creation", err)
+	}
+	if d := indexDim(t, addr, col); d != 1536 {
+		t.Errorf("index dim = %d, want 1536", d)
+	}
 }
