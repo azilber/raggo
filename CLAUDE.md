@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-go build . ./rag/... ./config/... ./examples/local_llm   # library + the local-LLM example
+go build . ./rag/... ./config/... ./examples/local_llm ./examples/redis_quickstart   # library + the local-LLM and Redis quickstart examples
 go vet . ./rag/... ./config/...                          # add -tags=integration to vet the integration tests too
 go run ./examples/simple                                 # examples in their own dirs: simple, contextual, chat, chromem, local_llm
 go run examples/full_process.go                          # loose files in examples/ are each a separate `package main`
@@ -83,7 +83,7 @@ The factory that actually runs is the `switch` in `rag.NewVectorDB` (`rag/vector
 
 Backend-specific settings arrive through `rag.Config.Parameters` (for example `"dimension"`).
 
-`ContextualRAG`, `SimpleRAG` and `RAG` all take the backend from their config's `DBType`/`DBAddress` (defaults are Milvus at `localhost:19530`). `RAG`'s collection schema hardcodes `Dimension: 1536` (`rag.go`).
+`ContextualRAG`, `SimpleRAG` and `RAG` all take the backend from their config's `DBType`/`DBAddress` (defaults are Milvus at `localhost:19530`). `RAG` sizes new collections from `RAGConfig.Dimension`, or, when that's 0, from one probe embedding (`dimension()` in `rag.go`); `SetEmbedURL` points its embedder at any OpenAI-compatible endpoint.
 
 ### Redis backend (`rag/redis.go`, Redis 8.4+)
 
@@ -101,8 +101,8 @@ Backend-specific settings arrive through `rag.Config.Parameters` (for example `"
 Providers register themselves in `init()` functions in `rag/providers/` (`openai.go`, `example_provider.go`) through `providers.Register(name, factory)`. The package keeps a separate `RegisterEmbedder` registry as well. Use `example_provider.go` as the template for a new provider.
 
 - **Any OpenAI-compatible embeddings server** (llama.cpp, KoboldCpp, Gemini) works through the `openai` provider with `raggo.SetOption("api_url", url)` on `raggo.NewEmbedder`. The key must be non-empty even when the server ignores it.
-- **A provider that needs extra request fields** (for example Gemini's `dimensions: 1536`, which makes it fit `RAG`'s fixed schema) is registered at runtime with `providers.RegisterEmbedder`, as `rag_integration_test.go` does. `RAG`, `Retriever` and `NewEmbedder` all look providers up by name.
+- **A provider that needs extra request fields** (for example Gemini's `dimensions: 1536`) is registered at runtime with `providers.RegisterEmbedder`, as `rag_integration_test.go` does. `RAG`, `Retriever` and `NewEmbedder` all look providers up by name.
 
 ### Local LLMs
 
-[USAGE.md](USAGE.md) and `examples/local_llm` cover RAG on llama.cpp, KoboldCpp or Gemini. The example uses the building blocks rather than `RAG` for two reasons: `RAG`'s schema is fixed at 1536 dimensions while local embedding models are usually smaller, and gollm's `openai` endpoint can't be pointed at a local server. Keep USAGE.md's commands and sample output in sync with the example, because both were taken from real runs. The same goes for its CPU-only commands and its CPU vs GPU timing table: re-run and re-measure instead of hand-editing numbers. Don't claim GPU offload without evidence. Check `llama-server --list-devices` or the log's `CPU`/`CUDA0` buffer lines, because `-ngl`/`--gpulayers` alone proves nothing.
+[USAGE.md](USAGE.md) and `examples/local_llm` cover RAG on llama.cpp, KoboldCpp or Gemini. `examples/redis_quickstart` shows `raggo.RAG` on a local embeddings server; `examples/local_llm` uses the building blocks because answer generation needs a direct chat call (gollm's `openai` endpoint can't be pointed at a local server). Keep USAGE.md's commands and sample output in sync with the example, because both were taken from real runs. The same goes for its CPU-only commands and its CPU vs GPU timing table: re-run and re-measure instead of hand-editing numbers. Don't claim GPU offload without evidence. Check `llama-server --list-devices` or the log's `CPU`/`CUDA0` buffer lines, because `-ngl`/`--gpulayers` alone proves nothing.
