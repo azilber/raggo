@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -185,9 +186,16 @@ func validName(kind, name string) error {
 }
 
 // keyID extracts the numeric ID from a "<collection>:<id>" key.
-func keyID(key string) int64 {
-	id, _ := strconv.ParseInt(key[strings.LastIndexByte(key, ':')+1:], 10, 64)
-	return id
+func keyID(key string) (int64, error) {
+	i := strings.LastIndexByte(key, ':')
+	if i < 0 {
+		return 0, fmt.Errorf("redis key %q has no <collection>:<id> form", key)
+	}
+	id, err := strconv.ParseInt(key[i+1:], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("redis key %q has no numeric ID: %w", key, err)
+	}
+	return id, nil
 }
 
 // efRuntime reads the HNSW search-time ef from searchParams, as MilvusDB does.
@@ -196,6 +204,40 @@ func efRuntime(params map[string]interface{}) int {
 		return ef
 	}
 	return 10 // Redis default EF_RUNTIME
+}
+
+// floatParam reads a numeric searchParam given as any Go number type or a
+// json.Number (from a UseNumber decoder). Absent means def. Anything else, or a
+// NaN, infinite or negative value, is an error rather than a silent fallback:
+// Redis would accept NaN and return scrambled rankings.
+func floatParam(params map[string]interface{}, key string, def float64) (float64, error) {
+	v, ok := params[key]
+	if !ok {
+		return def, nil
+	}
+	var f float64
+	if n, isNum := v.(json.Number); isNum {
+		var err error
+		if f, err = n.Float64(); err != nil {
+			return 0, fmt.Errorf("searchParams[%q]: %w", key, err)
+		}
+	} else {
+		rv := reflect.ValueOf(v)
+		switch {
+		case rv.CanInt():
+			f = float64(rv.Int())
+		case rv.CanUint():
+			f = float64(rv.Uint())
+		case rv.CanFloat():
+			f = rv.Float()
+		default:
+			return 0, fmt.Errorf("searchParams[%q] must be a number, got %T", key, v)
+		}
+	}
+	if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
+		return 0, fmt.Errorf("searchParams[%q] must be a finite number >= 0, got %v", key, v)
+	}
+	return f, nil
 }
 
 // idCounterKey holds the AutoID counter. It's a string key, so the hash-only index ignores it.
@@ -450,7 +492,11 @@ func (r *RedisDB) Search(ctx context.Context, collectionName string, vectors map
 				fields[c] = v
 			}
 		}
-		results = append(results, SearchResult{ID: keyID(doc.ID), Score: distToScore(dist, metricType), Fields: fields})
+		id, err := keyID(doc.ID)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, SearchResult{ID: id, Score: distToScore(dist, metricType), Fields: fields})
 	}
 	return results, nil
 }
@@ -458,7 +504,7 @@ func (r *RedisDB) Search(ctx context.Context, collectionName string, vectors map
 // HybridSearch fuses BM25 text search on Text with vector KNN using FT.HYBRID.
 // The query text comes from searchParams["query_text"]; when it is missing or
 // matches no document, this falls back to plain KNN (see knnOnly). Fusion: searchParams["combine"] = "RRF" (default) or "LINEAR"
-// with optional "alpha"/"beta" weights. FT.HYBRID takes one vector field, so
+// with optional numeric "alpha"/"beta" weights (default 0.5 each). FT.HYBRID takes one vector field, so
 // several fields run one FT.HYBRID each (pipelined) and are merged with RRF.
 func (r *RedisDB) HybridSearch(ctx context.Context, collectionName string, vectors map[string]Vector, topK int, metricType string, searchParams map[string]interface{}, reranker interface{}) ([]SearchResult, error) {
 	if reranker != nil {
@@ -475,6 +521,16 @@ func (r *RedisDB) HybridSearch(ctx context.Context, collectionName string, vecto
 			return nil, err
 		}
 	}
+	combine, _ := searchParams["combine"].(string)
+	linear := strings.EqualFold(combine, "LINEAR")
+	alpha, err := floatParam(searchParams, "alpha", 0.5)
+	if err != nil {
+		return nil, err
+	}
+	beta, err := floatParam(searchParams, "beta", 0.5)
+	if err != nil {
+		return nil, err
+	}
 	text, _ := searchParams["query_text"].(string)
 	query := textQuery(text)
 	// With no text, or text no document contains, FT.HYBRID would fuse KNN with an
@@ -486,14 +542,12 @@ func (r *RedisDB) HybridSearch(ctx context.Context, collectionName string, vecto
 	if matches == 0 {
 		return r.knnOnly(ctx, collectionName, vectors, topK, metricType, searchParams)
 	}
-	combine, _ := searchParams["combine"].(string)
-	linear := strings.EqualFold(combine, "LINEAR")
 	cols := r.columns()
 
 	pipe := r.client.Pipeline()
 	cmds := make([]*redis.Cmd, 0, len(vectors))
 	for field, vec := range vectors {
-		cmds = append(cmds, pipe.Do(ctx, hybridArgs(collectionName, query, field, vec, topK, linear, searchParams, cols)...))
+		cmds = append(cmds, pipe.Do(ctx, hybridArgs(collectionName, query, field, vec, topK, linear, alpha, beta, searchParams, cols)...))
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		return nil, fmt.Errorf("redis FT.HYBRID %s: %w", collectionName, err)
@@ -567,20 +621,12 @@ func (r *RedisDB) knnOnly(ctx context.Context, index string, vectors map[string]
 }
 
 // hybridArgs builds one FT.HYBRID command (syntax: redis.io/docs/latest/commands/ft.hybrid).
-func hybridArgs(index, query, field string, vec Vector, topK int, linear bool, params map[string]interface{}, cols []string) []interface{} {
+func hybridArgs(index, query, field string, vec Vector, topK int, linear bool, alpha, beta float64, params map[string]interface{}, cols []string) []interface{} {
 	window := max(topK, 20) // 20 is Redis's default fusion window
 	args := []interface{}{"FT.HYBRID", index,
 		"SEARCH", query,
 		"VSIM", "@" + field, "$vec", "KNN", 4, "K", topK, "EF_RUNTIME", efRuntime(params)}
 	if linear {
-		alpha, ok := params["alpha"].(float64)
-		if !ok {
-			alpha = 0.5
-		}
-		beta, ok := params["beta"].(float64)
-		if !ok {
-			beta = 0.5
-		}
 		args = append(args, "COMBINE", "LINEAR", 6, "ALPHA", alpha, "BETA", beta, "WINDOW", window)
 	} else {
 		args = append(args, "COMBINE", "RRF", 4, "CONSTANT", rrfK, "WINDOW", window)
@@ -633,7 +679,11 @@ func parseHybrid(reply interface{}, cols []string) ([]SearchResult, error) {
 				fields[c] = v
 			}
 		}
-		results = append(results, SearchResult{ID: keyID(fmt.Sprint(key)), Score: score, Fields: fields})
+		id, err := keyID(fmt.Sprint(key))
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, SearchResult{ID: id, Score: score, Fields: fields})
 	}
 	return results, nil
 }
