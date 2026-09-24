@@ -76,6 +76,9 @@ type RAGConfig struct {
 	LLMModel string // Language model for text generation
 	APIKey   string // API key for the provider
 
+	EmbedURL  string // OpenAI-compatible embeddings endpoint; empty uses the provider's default
+	Dimension int    // Embedding size for new collections; 0 measures it from the embedder
+
 	// Search settings control retrieval behavior
 	TopK      int     // Number of results to retrieve
 	MinScore  float64 // Minimum similarity score threshold
@@ -232,6 +235,25 @@ func SetDBAddress(address string) RAGOption {
 func SetDBType(dbType string) RAGOption {
 	return func(c *RAGConfig) {
 		c.DBType = dbType
+	}
+}
+
+// SetEmbedURL points the embedder at an OpenAI-compatible embeddings endpoint,
+// such as a local llama.cpp or KoboldCpp server
+// ("http://localhost:8081/v1/embeddings"). The API key is sent to this URL as a
+// Bearer token, so only use endpoints you trust.
+func SetEmbedURL(url string) RAGOption {
+	return func(c *RAGConfig) {
+		c.EmbedURL = url
+	}
+}
+
+// SetDimension fixes the embedding size used when RAG creates a collection.
+// Leave it at 0 (the default) to measure it from the embedder, which costs one
+// embedding request per collection created. Negative values are an error.
+func SetDimension(n int) RAGOption {
+	return func(c *RAGConfig) {
+		c.Dimension = n
 	}
 }
 
@@ -394,11 +416,15 @@ func (r *RAG) initialize() error {
 	}
 
 	// Initialize embedder
-	embedder, err := NewEmbedder(
+	embedOpts := []EmbedderOption{
 		SetEmbedderProvider(r.config.Provider),
 		SetEmbedderModel(r.config.Model),
 		SetEmbedderAPIKey(r.config.APIKey),
-	)
+	}
+	if r.config.EmbedURL != "" {
+		embedOpts = append(embedOpts, SetOption("api_url", r.config.EmbedURL))
+	}
+	embedder, err := NewEmbedder(embedOpts...)
 	if err != nil {
 		return fmt.Errorf("failed to create embedder: %w", err)
 	}
@@ -514,7 +540,11 @@ func (r *RAG) ProcessWithContext(ctx context.Context, source string, llmModel st
 
 	if !exists {
 		// Create collection with schema
-		schema := collectionSchema(r.config.Collection, 1536)
+		dim, err := r.dimension(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to create collection: %w", err)
+		}
+		schema := collectionSchema(r.config.Collection, dim)
 
 		if err := r.db.CreateCollection(ctx, r.config.Collection, schema); err != nil {
 			return fmt.Errorf("failed to create collection: %w", err)
@@ -703,7 +733,11 @@ func (r *RAG) ensureCollection(ctx context.Context) error {
 	}
 
 	if !exists {
-		schema := collectionSchema(r.config.Collection, 1536)
+		dim, err := r.dimension(ctx)
+		if err != nil {
+			return err
+		}
+		schema := collectionSchema(r.config.Collection, dim)
 
 		if err := r.db.CreateCollection(ctx, r.config.Collection, schema); err != nil {
 			return err
@@ -745,6 +779,26 @@ func (r *RAG) vectorIndex() Index {
 			"efConstruction": 256,
 		},
 	}
+}
+
+// dimension returns the embedding size for a new collection: the configured
+// Dimension, or, when that is 0, the length of one probe embedding. The result
+// is not stored, so concurrent callers share no state.
+func (r *RAG) dimension(ctx context.Context) (int, error) {
+	if r.config.Dimension < 0 {
+		return 0, fmt.Errorf("RAGConfig.Dimension must be >= 0 (0 measures it), got %d", r.config.Dimension)
+	}
+	if r.config.Dimension > 0 {
+		return r.config.Dimension, nil
+	}
+	vec, err := r.embedder.Embed(ctx, "dimension probe")
+	if err != nil {
+		return 0, fmt.Errorf("measure embedding dimension: %w", err)
+	}
+	if len(vec) == 0 {
+		return 0, fmt.Errorf("measure embedding dimension: embedder returned an empty vector")
+	}
+	return len(vec), nil
 }
 
 func (r *RAG) processDocument(ctx context.Context, path string, chunker Chunker) error { // Changed: use interface

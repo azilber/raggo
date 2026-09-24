@@ -19,8 +19,10 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode"
@@ -420,5 +422,59 @@ func TestRAGCharacterizeProcessWithContextSchema(t *testing.T) {
 	}
 	if d := indexDim(t, addr, col); d != 1536 {
 		t.Errorf("index dim = %d, want 1536", d)
+	}
+}
+
+// raggo.RAG with a local-style 768-dim OpenAI-compatible endpoint on Redis:
+// the index is sized from the model and hybrid search finds the right chunk.
+func TestRAGLocalEmbeddingsOnRedis(t *testing.T) {
+	addr := redisAddrOrSkip(t)
+	ctx := t.Context()
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		var req struct {
+			Input string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"data": []map[string]interface{}{{"embedding": bowVector(req.Input, 768)}},
+		})
+	}))
+	defer srv.Close()
+
+	const col = "raggo_it_local768"
+	dropCollection(t, addr, col)
+	t.Cleanup(func() { dropCollection(t, addr, col) })
+	r, err := raggo.NewRAG(
+		raggo.SetDBType("redis"),
+		raggo.SetDBAddress(addr),
+		raggo.SetCollection(col),
+		raggo.SetEmbedURL(srv.URL+"/v1/embeddings"),
+		raggo.SetAPIKey("none"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	if err := r.LoadDocuments(ctx, "examples/chat/docs"); err != nil {
+		t.Fatalf("LoadDocuments: %v", err)
+	}
+	if d := indexDim(t, addr, col); d != 768 {
+		t.Errorf("index dim = %d, want 768", d)
+	}
+	res, err := r.Query(ctx, pvQuestion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) == 0 || !strings.Contains(strings.ToLower(res[0].Content), "pressurevalve") {
+		t.Errorf("top result is not the PressureValve chunk: %+v", res)
+	}
+	if calls.Load() == 0 {
+		t.Error("embeddings server was never called: EmbedURL not used")
 	}
 }
