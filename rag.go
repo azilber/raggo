@@ -514,29 +514,14 @@ func (r *RAG) ProcessWithContext(ctx context.Context, source string, llmModel st
 
 	if !exists {
 		// Create collection with schema
-		schema := Schema{
-			Name: r.config.Collection,
-			Fields: []Field{
-				{Name: "ID", DataType: "int64", PrimaryKey: true, AutoID: true},
-				{Name: "Embedding", DataType: "float_vector", Dimension: 1536},
-				{Name: "Text", DataType: "varchar", MaxLength: 65535},
-				{Name: "Metadata", DataType: "varchar", MaxLength: 65535},
-			},
-		}
+		schema := collectionSchema(r.config.Collection, 1536)
 
 		if err := r.db.CreateCollection(ctx, r.config.Collection, schema); err != nil {
 			return fmt.Errorf("failed to create collection: %w", err)
 		}
 
 		// Create index
-		index := Index{
-			Type:   r.config.IndexType,
-			Metric: r.config.IndexMetric,
-			Parameters: map[string]interface{}{
-				"M":              16,
-				"efConstruction": 256,
-			},
-		}
+		index := r.vectorIndex()
 
 		if err := r.db.CreateIndex(ctx, r.config.Collection, "Embedding", index); err != nil {
 			return fmt.Errorf("failed to create index: %w", err)
@@ -718,28 +703,13 @@ func (r *RAG) ensureCollection(ctx context.Context) error {
 	}
 
 	if !exists {
-		schema := Schema{
-			Name: r.config.Collection,
-			Fields: []Field{
-				{Name: "ID", DataType: "int64", PrimaryKey: true, AutoID: true},
-				{Name: "Embedding", DataType: "float_vector", Dimension: 1536},
-				{Name: "Text", DataType: "varchar", MaxLength: 65535},
-				{Name: "Metadata", DataType: "varchar", MaxLength: 65535},
-			},
-		}
+		schema := collectionSchema(r.config.Collection, 1536)
 
 		if err := r.db.CreateCollection(ctx, r.config.Collection, schema); err != nil {
 			return err
 		}
 
-		index := Index{
-			Type:   r.config.IndexType,
-			Metric: r.config.IndexMetric,
-			Parameters: map[string]interface{}{
-				"M":              16,
-				"efConstruction": 256,
-			},
-		}
+		index := r.vectorIndex()
 
 		if err := r.db.CreateIndex(ctx, r.config.Collection, "Embedding", index); err != nil {
 			return err
@@ -749,6 +719,32 @@ func (r *RAG) ensureCollection(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// collectionSchema is the schema RAG stores chunks in: an auto ID, the
+// embedding, the chunk text and its JSON metadata.
+func collectionSchema(name string, dim int) Schema {
+	return Schema{
+		Name: name,
+		Fields: []Field{
+			{Name: "ID", DataType: "int64", PrimaryKey: true, AutoID: true},
+			{Name: "Embedding", DataType: "float_vector", Dimension: dim},
+			{Name: "Text", DataType: "varchar", MaxLength: 65535},
+			{Name: "Metadata", DataType: "varchar", MaxLength: 65535},
+		},
+	}
+}
+
+// vectorIndex is the HNSW index RAG builds on the Embedding field.
+func (r *RAG) vectorIndex() Index {
+	return Index{
+		Type:   r.config.IndexType,
+		Metric: r.config.IndexMetric,
+		Parameters: map[string]interface{}{
+			"M":              16,
+			"efConstruction": 256,
+		},
+	}
 }
 
 func (r *RAG) processDocument(ctx context.Context, path string, chunker Chunker) error { // Changed: use interface
