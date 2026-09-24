@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -205,27 +206,38 @@ func efRuntime(params map[string]interface{}) int {
 	return 10 // Redis default EF_RUNTIME
 }
 
-// floatParam reads a numeric searchParam given as any Go number type. Absent
-// means def; any other type is an error rather than a silent fallback.
+// floatParam reads a numeric searchParam given as any Go number type or a
+// json.Number (from a UseNumber decoder). Absent means def. Anything else, or a
+// NaN, infinite or negative value, is an error rather than a silent fallback:
+// Redis would accept NaN and return scrambled rankings.
 func floatParam(params map[string]interface{}, key string, def float64) (float64, error) {
 	v, ok := params[key]
 	if !ok {
 		return def, nil
 	}
-	switch x := v.(type) {
-	case float64:
-		return x, nil
-	case float32:
-		return float64(x), nil
-	case int:
-		return float64(x), nil
-	case int32:
-		return float64(x), nil
-	case int64:
-		return float64(x), nil
-	default:
-		return 0, fmt.Errorf("searchParams[%q] must be a number, got %T", key, v)
+	var f float64
+	if n, isNum := v.(json.Number); isNum {
+		var err error
+		if f, err = n.Float64(); err != nil {
+			return 0, fmt.Errorf("searchParams[%q]: %w", key, err)
+		}
+	} else {
+		rv := reflect.ValueOf(v)
+		switch {
+		case rv.CanInt():
+			f = float64(rv.Int())
+		case rv.CanUint():
+			f = float64(rv.Uint())
+		case rv.CanFloat():
+			f = rv.Float()
+		default:
+			return 0, fmt.Errorf("searchParams[%q] must be a number, got %T", key, v)
+		}
 	}
+	if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
+		return 0, fmt.Errorf("searchParams[%q] must be a finite number >= 0, got %v", key, v)
+	}
+	return f, nil
 }
 
 // idCounterKey holds the AutoID counter. It's a string key, so the hash-only index ignores it.
