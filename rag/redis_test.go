@@ -58,6 +58,35 @@ func TestKeyID(t *testing.T) {
 	}
 }
 
+func TestEfRuntime(t *testing.T) {
+	tests := []struct {
+		name    string
+		params  map[string]interface{}
+		want    int
+		wantErr bool
+	}{
+		{name: "absent uses Redis default", params: nil, want: 10},
+		{name: "float64 from JSON config", params: map[string]interface{}{"ef": float64(64)}, want: 64},
+		{name: "fractional is an error", params: map[string]interface{}{"ef": 64.5}, wantErr: true},
+		{name: "zero is an error", params: map[string]interface{}{"ef": 0}, wantErr: true},
+		{name: "above MaxInt32 is an error", params: map[string]interface{}{"ef": 1e12}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := efRuntime(tt.params)
+			if tt.wantErr {
+				if err == nil || !strings.Contains(err.Error(), `"ef"`) {
+					t.Errorf("efRuntime(%v) err = %v, want error naming \"ef\"", tt.params, err)
+				}
+				return
+			}
+			if err != nil || got != tt.want {
+				t.Errorf("efRuntime(%v) = %d, %v; want %d, nil", tt.params, got, err, tt.want)
+			}
+		})
+	}
+}
+
 func TestFloatParam(t *testing.T) {
 	tests := []struct {
 		name    string
