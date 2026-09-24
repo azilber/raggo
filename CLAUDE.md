@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 go build . ./rag/... ./config/... ./examples/local_llm ./examples/redis_quickstart   # library + the local-LLM and Redis quickstart examples
 go vet . ./rag/... ./config/...                          # add -tags=integration to vet the integration tests too
-go run ./examples/simple                                 # examples in their own dirs: simple, contextual, chat, chromem, local_llm
+go run ./examples/simple                                 # examples in their own dirs: simple, contextual, chat, chromem, local_llm, redis_quickstart
 go run examples/full_process.go                          # loose files in examples/ are each a separate `package main`
 ```
 

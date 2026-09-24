@@ -76,8 +76,11 @@ type RAGConfig struct {
 	LLMModel string // Language model for text generation
 	APIKey   string // API key for the provider
 
-	EmbedURL  string // OpenAI-compatible embeddings endpoint; empty uses the provider's default
-	Dimension int    // Embedding size for new collections; 0 measures it from the embedder
+	// EmbedURL is an OpenAI-compatible embeddings endpoint; empty uses the
+	// provider's default. The API key (default $OPENAI_API_KEY) is sent to
+	// it; set APIKey explicitly for non-OpenAI endpoints.
+	EmbedURL  string
+	Dimension int // Embedding size for new collections; 0 measures it from the embedder
 
 	// Search settings control retrieval behavior
 	TopK      int     // Number of results to retrieve
@@ -241,7 +244,9 @@ func SetDBType(dbType string) RAGOption {
 // SetEmbedURL points the embedder at an OpenAI-compatible embeddings endpoint,
 // such as a local llama.cpp or KoboldCpp server
 // ("http://localhost:8081/v1/embeddings"). The API key is sent to this URL as a
-// Bearer token, so only use endpoints you trust.
+// Bearer token, so only use endpoints you trust. APIKey defaults to
+// $OPENAI_API_KEY, so set it explicitly (for example SetAPIKey("none") for a
+// local server) to keep your OpenAI key from being sent to another endpoint.
 func SetEmbedURL(url string) RAGOption {
 	return func(c *RAGConfig) {
 		c.EmbedURL = url
@@ -250,7 +255,8 @@ func SetEmbedURL(url string) RAGOption {
 
 // SetDimension fixes the embedding size used when RAG creates a collection.
 // Leave it at 0 (the default) to measure it from the embedder, which costs one
-// embedding request per collection created. Negative values are an error.
+// embedding request per collection created. Negative values are an error,
+// reported when a collection is created.
 func SetDimension(n int) RAGOption {
 	return func(c *RAGConfig) {
 		c.Dimension = n
