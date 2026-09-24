@@ -12,7 +12,9 @@ go run examples/full_process.go     # loose files in examples/ are each a separa
 ```
 
 - Don't run `go build ./...` / `go vet ./...`. Every loose file in `examples/` declares `package main` in one directory, so they clash. Build or run them one file at a time.
-- There are no `_test.go` files yet. To run a single test once some exist: `go test ./rag -run TestName -v`.
+- Unit tests: `go test -race . ./rag/...`. Single test: `go test ./rag -run TestName -v`.
+- Redis integration tests skip unless `REDIS_ADDR` is set: `docker run -d --rm -p 6379:6379 --name raggo-redis redis:8.4`, then `REDIS_ADDR=localhost:6379 go test -race ./rag -run TestRedis -v`.
+- End-to-end RAG test (Gemini embeddings + generation on Redis) is behind a build tag: `REDIS_ADDR=localhost:6379 GEMINI_API_KEY=... go test -tags=integration -run TestGeminiRAG -v .`
 - Most examples and all LLM or embedding paths need `OPENAI_API_KEY`. The Milvus-backed paths need a Milvus server at `localhost:19530`.
 
 ## Architecture
@@ -42,7 +44,7 @@ Backend-specific settings arrive through `rag.Config.Parameters` (for example `"
 
 `ContextualRAG`, `SimpleRAG` and `RAG` all take the backend from their config's `DBType`/`DBAddress` (defaults are Milvus at `localhost:19530`).
 
-Redis (`rag/redis.go`) needs Redis 8.4+ (`FT.HYBRID`). Its hybrid search reads the user's text from `searchParams["query_text"]`, which `withQueryText` (`retriever.go`) adds. Integration tests run with `REDIS_ADDR=localhost:6379 go test ./rag -run TestRedis -v` against `docker run -p 6379:6379 redis:8.4`.
+Redis (`rag/redis.go`) needs Redis 8.4+ (`FT.HYBRID`). Its hybrid search reads the user's text from `searchParams["query_text"]`, which `withQueryText` (`retriever.go`) adds.
 
 ### Embedding providers
 

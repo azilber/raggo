@@ -1,6 +1,6 @@
 module github.com/teilomillet/raggo
 
-go 1.24
+go 1.27.1
 
 require (
 	github.com/danaugrs/go-tsne/tsne v0.0.0-20220306155740-2250969e057f
