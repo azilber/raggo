@@ -198,12 +198,18 @@ func keyID(key string) (int64, error) {
 	return id, nil
 }
 
-// efRuntime reads the HNSW search-time ef from searchParams, as MilvusDB does.
-func efRuntime(params map[string]interface{}) int {
-	if ef, ok := params["ef"].(int); ok && ef > 0 {
-		return ef
+// efRuntime reads the HNSW search-time ef as any Go number (float64 when it
+// comes from JSON config); absent means Redis's default, 10. Anything but a
+// whole number in [1, MaxInt32] is an error, which also keeps int() safe.
+func efRuntime(params map[string]interface{}) (int, error) {
+	f, err := floatParam(params, "ef", 10)
+	if err != nil {
+		return 0, err
 	}
-	return 10 // Redis default EF_RUNTIME
+	if f < 1 || f > math.MaxInt32 || f != math.Trunc(f) {
+		return 0, fmt.Errorf("searchParams[%q] must be a whole number from 1 to %d, got %v", "ef", math.MaxInt32, params["ef"])
+	}
+	return int(f), nil
 }
 
 // floatParam reads a numeric searchParam given as any Go number type or a
@@ -461,6 +467,10 @@ func (r *RedisDB) Search(ctx context.Context, collectionName string, vectors map
 	if err := validName("field", field); err != nil {
 		return nil, err
 	}
+	ef, err := efRuntime(searchParams)
+	if err != nil {
+		return nil, err
+	}
 
 	cols := r.columns()
 	returns := []redis.FTSearchReturn{{FieldName: "__dist"}}
@@ -470,7 +480,7 @@ func (r *RedisDB) Search(ctx context.Context, collectionName string, vectors map
 	res, err := r.client.FTSearchWithArgs(ctx, collectionName,
 		fmt.Sprintf("*=>[KNN $K @%s $vec EF_RUNTIME $EF AS __dist]", field),
 		&redis.FTSearchOptions{
-			Params:         map[string]interface{}{"K": topK, "EF": efRuntime(searchParams), "vec": float32Bytes(vec)},
+			Params:         map[string]interface{}{"K": topK, "EF": ef, "vec": float32Bytes(vec)},
 			DialectVersion: 2,
 			Return:         returns,
 			SortBy:         []redis.FTSearchSortBy{{FieldName: "__dist", Asc: true}},
@@ -531,6 +541,10 @@ func (r *RedisDB) HybridSearch(ctx context.Context, collectionName string, vecto
 	if err != nil {
 		return nil, err
 	}
+	ef, err := efRuntime(searchParams)
+	if err != nil {
+		return nil, err
+	}
 	text, _ := searchParams["query_text"].(string)
 	query := textQuery(text)
 	// With no text, or text no document contains, FT.HYBRID would fuse KNN with an
@@ -547,7 +561,7 @@ func (r *RedisDB) HybridSearch(ctx context.Context, collectionName string, vecto
 	pipe := r.client.Pipeline()
 	cmds := make([]*redis.Cmd, 0, len(vectors))
 	for field, vec := range vectors {
-		cmds = append(cmds, pipe.Do(ctx, hybridArgs(collectionName, query, field, vec, topK, linear, alpha, beta, searchParams, cols)...))
+		cmds = append(cmds, pipe.Do(ctx, hybridArgs(collectionName, query, field, vec, topK, linear, alpha, beta, ef, cols)...))
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		return nil, fmt.Errorf("redis FT.HYBRID %s: %w", collectionName, err)
@@ -621,11 +635,11 @@ func (r *RedisDB) knnOnly(ctx context.Context, index string, vectors map[string]
 }
 
 // hybridArgs builds one FT.HYBRID command (syntax: redis.io/docs/latest/commands/ft.hybrid).
-func hybridArgs(index, query, field string, vec Vector, topK int, linear bool, alpha, beta float64, params map[string]interface{}, cols []string) []interface{} {
+func hybridArgs(index, query, field string, vec Vector, topK int, linear bool, alpha, beta float64, ef int, cols []string) []interface{} {
 	window := max(topK, 20) // 20 is Redis's default fusion window
 	args := []interface{}{"FT.HYBRID", index,
 		"SEARCH", query,
-		"VSIM", "@" + field, "$vec", "KNN", 4, "K", topK, "EF_RUNTIME", efRuntime(params)}
+		"VSIM", "@" + field, "$vec", "KNN", 4, "K", topK, "EF_RUNTIME", ef}
 	if linear {
 		args = append(args, "COMBINE", "LINEAR", 6, "ALPHA", alpha, "BETA", beta, "WINDOW", window)
 	} else {
