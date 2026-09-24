@@ -198,8 +198,9 @@ func TestRedisHybridSearch(t *testing.T) {
 	if fmt.Sprint(ints) != fmt.Sprint(floats) {
 		t.Errorf("LINEAR int weights %v ranked differently from float weights %v", ints, floats)
 	}
+	// With this fixture 0/1 and 0.5/0.5 rank differently, so equal rankings mean the weights never reached Redis.
 	if fmt.Sprint(ints) == fmt.Sprint(defaults) {
-		t.Logf("note: 0/1 and 0.5/0.5 rank the same here (%v); the int-vs-float check still pins the fix", ints)
+		t.Errorf("LINEAR 0/1 ranked like the 0.5/0.5 default (%v): weights not reaching FT.HYBRID", ints)
 	}
 	// A non-numeric weight is an error, not a silent 0.5.
 	if _, err := db.HybridSearch(ctx, col, q, 3, "COSINE",
@@ -323,5 +324,27 @@ func TestRedisDropKeepsIDsUnique(t *testing.T) {
 		if r.ID <= maxID {
 			t.Errorf("recreated collection reused ID %d (max before drop %d)", r.ID, maxID)
 		}
+	}
+}
+
+// A hash under the collection prefix whose key has no numeric ID (written by
+// another tool) must surface as an error naming the key, never as ID 0.
+func TestRedisSearchRejectsForeignKeys(t *testing.T) {
+	db := redisTestDB(t)
+	ctx := context.Background()
+	const col = "raggo_test_foreign"
+	setupRedisDocs(t, db, col)
+	defer db.DropCollection(ctx, col)
+	const foreign = col + ":abc"
+	vec := Vector{0, 0, 0, 1}
+	must(t, db.(*RedisDB).client.HSet(ctx, foreign, "Embedding", float32Bytes(vec), "Text", "foreign widget").Err())
+	defer db.(*RedisDB).client.Del(ctx, foreign)
+
+	q := map[string]Vector{"Embedding": vec}
+	if _, err := db.Search(ctx, col, q, 4, "COSINE", nil); err == nil || !strings.Contains(err.Error(), foreign) {
+		t.Errorf("Search err = %v, want error naming %s", err, foreign)
+	}
+	if _, err := db.HybridSearch(ctx, col, q, 4, "COSINE", map[string]interface{}{"query_text": "foreign widget"}, nil); err == nil || !strings.Contains(err.Error(), foreign) {
+		t.Errorf("HybridSearch err = %v, want error naming %s", err, foreign)
 	}
 }

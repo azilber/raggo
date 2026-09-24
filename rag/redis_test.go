@@ -112,14 +112,37 @@ func TestFuseRRF(t *testing.T) {
 }
 
 func TestRedisConnectErrorHidesPassword(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	db, _ := newRedisDB(&Config{Address: "redis://user:s3cret@127.0.0.1:1/0"})
-	err := db.Connect(ctx)
-	if err == nil {
-		t.Fatal("expected connection error on port 1")
+	tests := []struct {
+		name string
+		addr string
+	}{
+		// url.Parse's own error quotes the whole URL, password included.
+		{name: "unparseable URL", addr: "redis://user:s3cret@host:notaport/0"},
+		{name: "unreachable server", addr: "redis://user:s3cret@127.0.0.1:1/0"},
 	}
-	if strings.Contains(err.Error(), "s3cret") {
-		t.Errorf("error leaks password: %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			db, _ := newRedisDB(&Config{Address: tt.addr})
+			err := db.Connect(ctx)
+			if err == nil {
+				t.Fatal("expected a connection error")
+			}
+			if strings.Contains(err.Error(), "s3cret") {
+				t.Errorf("error leaks password: %v", err)
+			}
+		})
+	}
+}
+
+// A bad LINEAR weight must fail before any Redis call: this RedisDB was never
+// connected, so reaching Redis would nil-deref instead of returning an error.
+func TestRedisHybridSearchRejectsBadWeightBeforeRedis(t *testing.T) {
+	db, _ := newRedisDB(&Config{})
+	_, err := db.HybridSearch(context.Background(), "docs", map[string]Vector{"Embedding": {1, 0}}, 3, "COSINE",
+		map[string]interface{}{"combine": "LINEAR", "alpha": "0.3"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "alpha") {
+		t.Errorf("err = %v, want error naming alpha", err)
 	}
 }
