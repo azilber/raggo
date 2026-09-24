@@ -2,6 +2,8 @@ package rag
 
 import (
 	"context"
+	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -70,6 +72,16 @@ func TestFloatParam(t *testing.T) {
 		{name: "int literal", params: map[string]interface{}{"alpha": 1}, want: 1},
 		{name: "int64", params: map[string]interface{}{"alpha": int64(2)}, want: 2},
 		{name: "string is an error", params: map[string]interface{}{"alpha": "0.3"}, wantErr: true},
+		{name: "zero is allowed", params: map[string]interface{}{"alpha": 0}, want: 0},
+		{name: "uint", params: map[string]interface{}{"alpha": uint(1)}, want: 1},
+		{name: "int8", params: map[string]interface{}{"alpha": int8(2)}, want: 2},
+		{name: "uint64", params: map[string]interface{}{"alpha": uint64(3)}, want: 3},
+		{name: "json.Number from UseNumber", params: map[string]interface{}{"alpha": json.Number("0.25")}, want: 0.25},
+		{name: "malformed json.Number", params: map[string]interface{}{"alpha": json.Number("x")}, wantErr: true},
+		{name: "NaN is an error", params: map[string]interface{}{"alpha": math.NaN()}, wantErr: true},
+		{name: "+Inf is an error", params: map[string]interface{}{"alpha": math.Inf(1)}, wantErr: true},
+		{name: "negative is an error", params: map[string]interface{}{"alpha": -1}, wantErr: true},
+		{name: "nil value is an error", params: map[string]interface{}{"alpha": nil}, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
