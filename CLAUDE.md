@@ -26,7 +26,7 @@ These three are the required final check for work in this repo. They share one R
    ```bash
    REDIS_ADDR=localhost:6379 GEMINI_API_KEY=... go test -tags=integration -race -count=1 -run TestGeminiRAG -v .
    ```
-2. **llama.cpp (manual, `examples/local_llm`).** `--embeddings` restricts a server to embeddings, so run two. `/health` returns 503 while a model loads and 200 when it's ready. The chat server uses 8082 because 8080 was held by a Windows process on the WSL machine these runs were made on:
+2. **llama.cpp (manual, `examples/local_llm`).** `--embeddings` restricts a server to embeddings, so run two. `/health` returns 503 while a model loads and 200 when it's ready. The chat server uses 8082 because 8080 was held by a Windows process on the WSL machine these runs were made on. That machine's Homebrew `llama-server` has no GPU backend (`--list-devices` shows only `BLAS`), so this procedure runs on CPU and `-ngl 99` is ignored:
    ```bash
    llama-server -hf ggml-org/embeddinggemma-300M-GGUF --embeddings --pooling mean --port 8081 &
    llama-server -hf ggml-org/gemma-3-1b-it-GGUF -ngl 99 --port 8082 &
@@ -51,7 +51,9 @@ A llama.cpp or KoboldCpp run passes when the output shows all three of these:
 - `sample.txt` as the top source.
 - An answer describing PressureValve scaling or load balancing. PressureValve exists only in `examples/chat/docs/sample.txt`, so a correct answer proves retrieval worked.
 
-KoboldCpp's log shares the terminal, so `Answer:` can start mid-line. Grep for `Answer:`, not `^Answer`. KoboldCpp also takes a few seconds to exit after `pkill`.
+**CPU-only variants** (tested, same pass criteria): add `--usecpu` to the CUDA build and drop `--gpulayers`, or run `koboldcpp-linux-x64-nocuda` (`gh release download ... --pattern 'koboldcpp-linux-x64-nocuda'`) with no GPU flags. The anchored `pkill` pattern stops both builds. To tell CPU from GPU, check the log's buffer lines (`CPU model buffer size` vs `CUDA0 model buffer size`), not the `offloaded N/N layers to GPU` line, which `--usecpu` still prints as 27/27. Don't use `nvidia-smi` for this either: under WSL it lists no processes even during a GPU run.
+
+KoboldCpp's log shares the terminal, so `Answer:` can start mid-line. Grep for `Answer:`, not `^Answer`. Both servers take a few seconds to exit after `pkill`, so check again before assuming a stray process.
 
 When stopping servers, don't use `pkill -f` with a pattern that also appears in your own command line, because it kills the shell running it. Use `pkill -x llama-server`, or anchor the pattern as shown.
 
