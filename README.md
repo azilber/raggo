@@ -419,7 +419,7 @@ Check `/examples` for more:
 - Memory usage: `/examples/memory_enhancer_example.go`
 - Full pipeline: `/examples/full_process.go`
 - Benchmarks: `/examples/process_embedding_benchmark.go`
-- Local LLMs (llama.cpp or KoboldCpp) with Redis: [USAGE.md](USAGE.md)
+- RAG with Redis on llama.cpp, KoboldCpp, or Gemini: [USAGE.md](USAGE.md)
 
 ## License
 
