@@ -1,6 +1,6 @@
 # Raggo - Retrieval Augmented Generation Library
 
-> A flexible RAG (Retrieval Augmented Generation) library for Go, designed to make document processing and context-aware AI interactions simple and efficient.
+> A RAG (Retrieval Augmented Generation) library for Go: load, chunk and embed documents, then retrieve them with Redis hybrid (BM25 + vector) search. Milvus, chromem and an in-memory store are also supported.
 
 <p align="center">
   <strong>🔍 Smart Document Search • 💬 Context-Aware Responses • 🤖 Intelligent RAG</strong>
@@ -13,79 +13,108 @@
 
 ## Quick Start
 
-```go
-package main
+Index a folder into Redis and run a hybrid (BM25 + vector) query, with embeddings from a local model on CPU. You need Go 1.27.1+, Docker, and llama.cpp's `llama-server`. KoboldCpp and Gemini work too; see [USAGE.md](USAGE.md).
 
-import (
-	"context"
-	"fmt"
-	"github.com/teilomillet/raggo"
-)
-
-func main() {
-	// Initialize RAG with default settings
-	rag, err := raggo.NewSimpleRAG(raggo.DefaultConfig())
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return
-	}
-	defer rag.Close()
-
-	// Add documents from a directory
-	err = rag.AddDocuments(context.Background(), "./docs")
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return
-	}
-
-	// Search with natural language
-	response, _ := rag.Search(context.Background(), "What are the key features?")
-	fmt.Printf("Answer: %s\n", response)
-}
+```bash
+docker run -d --rm -p 6379:6379 --name raggo-redis redis:8.4
+llama-server -hf ggml-org/embeddinggemma-300M-GGUF --embeddings --pooling mean --device none --port 8081
 ```
+
+```go
+r, err := raggo.NewRAG(
+	raggo.WithRedis("quickstart"),                                // Redis 8.4+ at localhost:6379; hybrid search is on by default
+	raggo.SetEmbedURL("http://localhost:8081/v1/embeddings"),     // any OpenAI-compatible embeddings endpoint
+	raggo.SetAPIKey("none"),                                      // local servers ignore it, but raggo requires one
+)
+if err != nil {
+	log.Fatal(err)
+}
+defer r.Close()
+
+if err := r.LoadDocuments(ctx, "examples/chat/docs"); err != nil { // index size is measured from the model (768 here)
+	log.Fatal(err)
+}
+results, err := r.Query(ctx, "What did the PressureValve system do during Black Friday?")
+```
+
+The full program is [`examples/redis_quickstart`](examples/redis_quickstart/main.go):
+
+```bash
+go run ./examples/redis_quickstart
+```
+
+```text
+Inserting 1 records into collection: quickstart
+Inserting 1 records into collection: quickstart
+Inserting 1 records into collection: quickstart
+Inserting 1 records into collection: quickstart
+Inserting 1 records into collection: quickstart
+Inserting 1 records into collection: quickstart
+Performing hybrid search in collection quickstart for top 5 results with metric type L2
+1.000  MountainPass's PressureValve system is an innovative load balancing solution that helped the company handle unprecedented traffic during Black Friday  The system automatically scales resources based on incoming traffic patterns and distributes load across multiple servers  During Black Friday, when traffic spiked by 300%, PressureValve successfully maintained system stability and ensured zero downtime by dynamically allocating resources and routing requests efficiently
+0.984  Microservices Architecture Guide
+0.961  Vector Databases: A Comprehensive Overview
+0.946  Understanding RAG (Retrieval Augmented Generation) Systems
+0.946  Understanding Vector Embeddings in Machine Learning
+```
+
+Each line is a retrieved chunk and its score. To generate an answer from those chunks with a local chat model, see [USAGE.md](USAGE.md).
 
 ## Configuration
 
-Raggo provides a flexible configuration system that can be loaded from multiple sources (environment variables, JSON files, or programmatic defaults):
+Start from `raggo.DefaultRAGConfig()`, set what you need, and pass it to `raggo.NewRAG`:
 
 ```go
-// Load configuration (automatically checks standard paths)
-cfg, err := config.LoadConfig()
-if err != nil {
-    log.Fatal(err)
-}
+cfg := raggo.DefaultRAGConfig()
+cfg.DBType = "redis"
+cfg.DBAddress = "localhost:6379"                     // or "redis://user:pass@host:6379/0"
+cfg.Collection = "my_documents"
+cfg.EmbedURL = "http://localhost:8081/v1/embeddings" // llama.cpp; KoboldCpp: http://localhost:5001/v1/embeddings
+cfg.APIKey = "none"                                  // local servers ignore it; raggo requires one
+cfg.Dimension = 0                                    // 0 = measure from the model (768 for embeddinggemma-300M)
+cfg.IndexMetric = "COSINE"
+cfg.UseHybrid = true                                 // BM25 on the chunk text + vector KNN, fused by FT.HYBRID
+cfg.TopK = 5
+cfg.MinScore = 0.5                                   // scores are normalized to roughly [0,1]; higher is better
+cfg.ChunkSize = 300
+cfg.ChunkOverlap = 50
+cfg.SearchParams["combine"] = "RRF" // or "LINEAR" with "alpha" and "beta" weights
+cfg.SearchParams["ef"] = 64         // HNSW search depth
 
-// Or create a custom configuration
-cfg := &config.Config{
-    Provider:   "milvus",           // Vector store provider
-    Model:      "text-embedding-3-small",
-    Collection: "my_documents",
-    
-    // Search settings
-    DefaultTopK:     5,      // Number of similar chunks to retrieve
-    DefaultMinScore: 0.7,    // Similarity threshold
-    
-    // Document processing
-    DefaultChunkSize:    300,  // Size of text chunks
-    DefaultChunkOverlap: 50,   // Overlap between chunks
-}
-
-// Create RAG instance with config
-rag, err := raggo.NewSimpleRAG(cfg)
+r, err := raggo.NewRAG(func(c *raggo.RAGConfig) { *c = *cfg })
 ```
 
-Configuration can be saved for reuse:
+The same settings as options (`IndexMetric` has no option; set it on the struct):
+
 ```go
-err := cfg.Save("~/.raggo/config.json")
+r, err := raggo.NewRAG(
+	raggo.SetDBType("redis"),
+	raggo.SetDBAddress("localhost:6379"),
+	raggo.SetCollection("my_documents"),
+	raggo.SetEmbedURL("http://localhost:8081/v1/embeddings"),
+	raggo.SetAPIKey("none"),
+	raggo.SetSearchStrategy("hybrid"),
+	raggo.SetTopK(5),
+	raggo.SetMinScore(0.5),
+	raggo.SetChunkSize(300),
+	raggo.SetChunkOverlap(50),
+	raggo.SetDimension(0),
+)
 ```
 
-Environment variables (take precedence over config files):
-- `RAGGO_PROVIDER`: Service provider
-- `RAGGO_MODEL`: Model identifier
-- `RAGGO_COLLECTION`: Collection name
-- `RAGGO_API_KEY`: Default API key
+`APIKey` defaults to `$OPENAI_API_KEY` and is sent to `EmbedURL`; set it explicitly (as above) when `EmbedURL` isn't OpenAI.
 
+Redis search parameters (`SearchParams`) are checked before any Redis call, even the ones the chosen fusion doesn't use:
 
+| Key | Values | Default |
+|---|---|---|
+| `combine` | `RRF` or `LINEAR` | `RRF` |
+| `alpha`, `beta` | `LINEAR` weights, numbers ≥ 0 | 0.5 each |
+| `ef` | HNSW search depth, a whole number ≥ 1 | 64 in `DefaultRAGConfig` |
+
+`query_text`, the text half of hybrid search, is added automatically from the query. Redis 8.4+ is required (`FT.HYBRID`).
+
+The `config` package (`config.LoadConfig` and the `RAGGO_*` variables) isn't read by the constructors yet; configure through `RAGConfig` or the options above.
 
 ## Table of Contents
 
