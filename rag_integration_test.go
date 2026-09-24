@@ -478,3 +478,39 @@ func TestRAGLocalEmbeddingsOnRedis(t *testing.T) {
 		t.Error("embeddings server was never called: EmbedURL not used")
 	}
 }
+
+// When the dimension probe fails, ensureCollection must not have created a
+// collection/index: LoadDocuments should error out before either.
+func TestRAGProbeFailureCreatesNoIndex(t *testing.T) {
+	addr := redisAddrOrSkip(t)
+	ctx := t.Context()
+	const col = "raggo_it_probe_fail"
+	dropCollection(t, addr, col)
+	t.Cleanup(func() { dropCollection(t, addr, col) })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	srv.Close() // closed immediately, so any request to it fails
+
+	r, err := raggo.NewRAG(
+		raggo.SetDBType("redis"),
+		raggo.SetDBAddress(addr),
+		raggo.SetCollection(col),
+		raggo.SetEmbedURL(srv.URL+"/v1/embeddings"),
+		raggo.SetAPIKey("none"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	err = r.LoadDocuments(ctx, "examples/chat/docs")
+	if err == nil || !strings.Contains(err.Error(), "measure embedding dimension") {
+		t.Fatalf("err = %v, want a dimension-probe error", err)
+	}
+
+	c := redis.NewClient(&redis.Options{Addr: addr, Protocol: 2})
+	defer c.Close()
+	if _, err := c.Do(ctx, "FT.INFO", col).Slice(); err == nil {
+		t.Errorf("FT.INFO %s succeeded, want no index after a failed dimension probe", col)
+	}
+}
