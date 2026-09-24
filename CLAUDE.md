@@ -17,6 +17,7 @@ go run examples/full_process.go                          # loose files in exampl
 - Redis integration tests (`rag/redis_integration_test.go`) are behind the `integration` build tag and need `REDIS_ADDR`: `docker run -d --rm -p 6379:6379 --name raggo-redis redis:8.4`, then `REDIS_ADDR=localhost:6379 go test -tags=integration -race ./rag -run TestRedis -v`.
 - Most examples, and the default embedding and LLM paths, need `OPENAI_API_KEY`; other embedding servers work through `api_url` (see Embedding providers). The Milvus-backed paths need a Milvus server at `localhost:19530`.
 - Never write API keys (`GEMINI_API_KEY`, `OPENAI_API_KEY`) into files. Pass them through the environment only.
+- `origin` is the fork `azilber/raggo`. Open PRs with `gh pr create --repo azilber/raggo --base main`; a plain `gh pr create` targets the upstream `teilomillet/raggo`.
 
 ## End-to-end tests
 
@@ -26,7 +27,7 @@ These three are the required final check for work in this repo. They share one R
    ```bash
    REDIS_ADDR=localhost:6379 GEMINI_API_KEY=... go test -tags=integration -race -count=1 -run TestGeminiRAG -v .
    ```
-2. **llama.cpp (manual, `examples/local_llm`).** `--embeddings` restricts a server to embeddings, so run two. `/health` returns 503 while a model loads and 200 when it's ready. The chat server uses 8082 because 8080 was held by a Windows process on the WSL machine these runs were made on:
+2. **llama.cpp (manual, `examples/local_llm`).** `--embeddings` restricts a server to embeddings, so run two. `/health` returns 503 while a model loads and 200 when it's ready. The chat server uses 8082 because 8080 was held by a Windows process on the WSL machine these runs were made on. That machine's Homebrew `llama-server` has no GPU backend (`--list-devices` shows only `BLAS`), so this procedure runs on CPU and `-ngl 99` is ignored:
    ```bash
    llama-server -hf ggml-org/embeddinggemma-300M-GGUF --embeddings --pooling mean --port 8081 &
    llama-server -hf ggml-org/gemma-3-1b-it-GGUF -ngl 99 --port 8082 &
@@ -34,7 +35,7 @@ These three are the required final check for work in this repo. They share one R
    REDIS_ADDR=localhost:6379 EMBED_URL=http://localhost:8081/v1/embeddings CHAT_URL=http://localhost:8082/v1/chat/completions go run ./examples/local_llm
    pkill -x llama-server
    ```
-3. **KoboldCpp (manual, `examples/local_llm`).** One process serves both endpoints on 5001. The binary (`koboldcpp-linux-x64`; use `koboldcpp-linux-x64-nocuda` without an NVIDIA GPU) and the GGUFs total about 1.7 GB, so download them into a scratch directory, never the repo:
+3. **KoboldCpp (manual, `examples/local_llm`).** One process serves both endpoints on 5001. The binary (`koboldcpp-linux-x64`; use `koboldcpp-linux-x64-nocuda` without an NVIDIA GPU) and the GGUFs total about 1.7 GB, so download them into a scratch directory, never the repo. The files stay in `/tmp/koboldcpp` between runs; if they're already there, skip the `gh` and `curl` lines:
    ```bash
    K=/tmp/koboldcpp && mkdir -p $K && cd $K
    gh release download --repo LostRuins/koboldcpp --pattern 'koboldcpp-linux-x64' --clobber && chmod +x koboldcpp-linux-x64
@@ -51,7 +52,9 @@ A llama.cpp or KoboldCpp run passes when the output shows all three of these:
 - `sample.txt` as the top source.
 - An answer describing PressureValve scaling or load balancing. PressureValve exists only in `examples/chat/docs/sample.txt`, so a correct answer proves retrieval worked.
 
-KoboldCpp's log shares the terminal, so `Answer:` can start mid-line. Grep for `Answer:`, not `^Answer`. KoboldCpp also takes a few seconds to exit after `pkill`.
+**CPU-only variants** (tested, same pass criteria): add `--usecpu` to the CUDA build and drop `--gpulayers`, or run `koboldcpp-linux-x64-nocuda` (`gh release download ... --pattern 'koboldcpp-linux-x64-nocuda'`) with no GPU flags. The anchored `pkill` pattern stops both builds. To tell CPU from GPU, check the log's buffer lines (`CPU model buffer size` vs `CUDA0 model buffer size`), not the `offloaded N/N layers to GPU` line, which `--usecpu` still prints as 27/27. Don't use `nvidia-smi` for this either: under WSL it lists no processes even during a GPU run.
+
+KoboldCpp's log shares the terminal, so `Answer:` can start mid-line. Grep for `Answer:`, not `^Answer`. Both servers take a few seconds to exit after `pkill`, so check again before assuming a stray process.
 
 When stopping servers, don't use `pkill -f` with a pattern that also appears in your own command line, because it kills the shell running it. Use `pkill -x llama-server`, or anchor the pattern as shown.
 
@@ -102,4 +105,4 @@ Providers register themselves in `init()` functions in `rag/providers/` (`openai
 
 ### Local LLMs
 
-[USAGE.md](USAGE.md) and `examples/local_llm` cover RAG on llama.cpp, KoboldCpp or Gemini. The example uses the building blocks rather than `RAG` for two reasons: `RAG`'s schema is fixed at 1536 dimensions while local embedding models are usually smaller, and gollm's `openai` endpoint can't be pointed at a local server. Keep USAGE.md's commands and sample output in sync with the example, because both were taken from real runs.
+[USAGE.md](USAGE.md) and `examples/local_llm` cover RAG on llama.cpp, KoboldCpp or Gemini. The example uses the building blocks rather than `RAG` for two reasons: `RAG`'s schema is fixed at 1536 dimensions while local embedding models are usually smaller, and gollm's `openai` endpoint can't be pointed at a local server. Keep USAGE.md's commands and sample output in sync with the example, because both were taken from real runs. The same goes for its CPU-only commands and its CPU vs GPU timing table: re-run and re-measure instead of hand-editing numbers. Don't claim GPU offload without evidence. Check `llama-server --list-devices` or the log's `CPU`/`CUDA0` buffer lines, because `-ngl`/`--gpulayers` alone proves nothing.
