@@ -513,9 +513,12 @@ func (r *RedisDB) Search(ctx context.Context, collectionName string, vectors map
 
 // HybridSearch fuses BM25 text search on Text with vector KNN using FT.HYBRID.
 // The query text comes from searchParams["query_text"]; when it is missing or
-// matches no document, this falls back to plain KNN (see knnOnly). Fusion: searchParams["combine"] = "RRF" (default) or "LINEAR"
-// with optional numeric "alpha"/"beta" weights (default 0.5 each). FT.HYBRID takes one vector field, so
-// several fields run one FT.HYBRID each (pipelined) and are merged with RRF.
+// matches no document, this falls back to plain KNN (see knnOnly).
+// Fusion: searchParams["combine"] = "RRF" (default) or "LINEAR", with optional
+// numeric "alpha"/"beta" weights (default 0.5 each). alpha, beta and "ef" are
+// validated before any Redis call even when unused, so a bad config fails fast.
+// FT.HYBRID takes one vector field, so several fields run one FT.HYBRID each
+// (pipelined) and are merged with RRF.
 func (r *RedisDB) HybridSearch(ctx context.Context, collectionName string, vectors map[string]Vector, topK int, metricType string, searchParams map[string]interface{}, reranker interface{}) ([]SearchResult, error) {
 	if reranker != nil {
 		return nil, fmt.Errorf("redis fuses inside FT.HYBRID; set searchParams[\"combine\"] instead of passing a reranker")

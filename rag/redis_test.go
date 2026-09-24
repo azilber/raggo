@@ -165,13 +165,25 @@ func TestRedisConnectErrorHidesPassword(t *testing.T) {
 	}
 }
 
-// A bad LINEAR weight must fail before any Redis call: this RedisDB was never
-// connected, so reaching Redis would nil-deref instead of returning an error.
-func TestRedisHybridSearchRejectsBadWeightBeforeRedis(t *testing.T) {
-	db, _ := newRedisDB(&Config{})
-	_, err := db.HybridSearch(context.Background(), "docs", map[string]Vector{"Embedding": {1, 0}}, 3, "COSINE",
-		map[string]interface{}{"combine": "LINEAR", "alpha": "0.3"}, nil)
-	if err == nil || !strings.Contains(err.Error(), "alpha") {
-		t.Errorf("err = %v, want error naming alpha", err)
+// Bad params fail before any Redis call (this RedisDB was never connected, so
+// reaching Redis would nil-deref), including weights RRF would never use.
+func TestRedisHybridSearchRejectsBadParamsBeforeRedis(t *testing.T) {
+	tests := []struct {
+		name    string
+		params  map[string]interface{}
+		wantKey string
+	}{
+		{name: "string alpha with LINEAR", params: map[string]interface{}{"combine": "LINEAR", "alpha": "0.3"}, wantKey: "alpha"},
+		{name: "string alpha with RRF (unused)", params: map[string]interface{}{"combine": "RRF", "alpha": "0.3"}, wantKey: "alpha"},
+		{name: "fractional ef", params: map[string]interface{}{"ef": 64.5}, wantKey: `"ef"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, _ := newRedisDB(&Config{})
+			_, err := db.HybridSearch(context.Background(), "docs", map[string]Vector{"Embedding": {1, 0}}, 3, "COSINE", tt.params, nil)
+			if err == nil || !strings.Contains(err.Error(), tt.wantKey) {
+				t.Errorf("err = %v, want error naming %s", err, tt.wantKey)
+			}
+		})
 	}
 }
