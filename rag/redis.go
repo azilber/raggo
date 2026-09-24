@@ -185,9 +185,16 @@ func validName(kind, name string) error {
 }
 
 // keyID extracts the numeric ID from a "<collection>:<id>" key.
-func keyID(key string) int64 {
-	id, _ := strconv.ParseInt(key[strings.LastIndexByte(key, ':')+1:], 10, 64)
-	return id
+func keyID(key string) (int64, error) {
+	i := strings.LastIndexByte(key, ':')
+	if i < 0 {
+		return 0, fmt.Errorf("redis key %q has no <collection>:<id> form", key)
+	}
+	id, err := strconv.ParseInt(key[i+1:], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("redis key %q has no numeric ID: %w", key, err)
+	}
+	return id, nil
 }
 
 // efRuntime reads the HNSW search-time ef from searchParams, as MilvusDB does.
@@ -450,7 +457,11 @@ func (r *RedisDB) Search(ctx context.Context, collectionName string, vectors map
 				fields[c] = v
 			}
 		}
-		results = append(results, SearchResult{ID: keyID(doc.ID), Score: distToScore(dist, metricType), Fields: fields})
+		id, err := keyID(doc.ID)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, SearchResult{ID: id, Score: distToScore(dist, metricType), Fields: fields})
 	}
 	return results, nil
 }
@@ -633,7 +644,11 @@ func parseHybrid(reply interface{}, cols []string) ([]SearchResult, error) {
 				fields[c] = v
 			}
 		}
-		results = append(results, SearchResult{ID: keyID(fmt.Sprint(key)), Score: score, Fields: fields})
+		id, err := keyID(fmt.Sprint(key))
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, SearchResult{ID: id, Score: score, Fields: fields})
 	}
 	return results, nil
 }
