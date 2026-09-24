@@ -27,7 +27,7 @@ The complete program is [`examples/local_llm/main.go`](examples/local_llm/main.g
 
 ### llama.cpp
 
-A server started with `--embeddings` serves embeddings only, so run two. `-hf` downloads the model on first use, and `-ngl 99` offloads all layers to the GPU:
+A server started with `--embeddings` serves embeddings only, so run two. `-hf` downloads the model on first use. `-ngl 99` offloads layers to the GPU only if your build has a GPU backend; check with `llama-server --list-devices` (a CPU-only build, such as the Homebrew one, lists only `BLAS` and ignores `-ngl`):
 
 ```bash
 llama-server -hf ggml-org/embeddinggemma-300M-GGUF --embeddings --pooling mean --port 8081
@@ -40,6 +40,13 @@ export CHAT_URL=http://localhost:8080/v1/chat/completions
 ```
 
 Both are ready when `curl localhost:8081/health` and `curl localhost:8080/health` return 200.
+
+**CPU only.** Drop `-ngl` and add `--device none`, which tells a GPU build not to offload (a CPU-only build runs on CPU either way):
+
+```bash
+llama-server -hf ggml-org/embeddinggemma-300M-GGUF --embeddings --pooling mean --device none --port 8081
+llama-server -hf ggml-org/gemma-3-1b-it-GGUF --device none --port 8080
+```
 
 ### KoboldCpp
 
@@ -56,7 +63,16 @@ export EMBED_URL=http://localhost:5001/v1/embeddings
 export CHAT_URL=http://localhost:5001/v1/chat/completions
 ```
 
-It is ready when `curl localhost:5001/v1/models` returns 200. Tested with the `koboldcpp-linux-x64` v1.121 release on an NVIDIA GPU. Without an NVIDIA GPU, use the `koboldcpp-linux-x64-nocuda` build from the same release.
+It is ready when `curl localhost:5001/v1/models` returns 200. Tested with the `koboldcpp-linux-x64` v1.121 release on an NVIDIA GPU.
+
+**CPU only.** Either add `--usecpu` to the CUDA build and drop `--gpulayers`, or use the smaller `koboldcpp-linux-x64-nocuda` build (from the same release) with no GPU flags:
+
+```bash
+./koboldcpp-linux-x64 --usecpu --model gemma-3-1b-it-Q4_K_M.gguf --embeddingsmodel embeddinggemma-300M-Q8_0.gguf --port 5001
+./koboldcpp-linux-x64-nocuda --model gemma-3-1b-it-Q4_K_M.gguf --embeddingsmodel embeddinggemma-300M-Q8_0.gguf --port 5001
+```
+
+To confirm where the model runs, read the startup log's buffer lines: CPU runs show `CPU model buffer size`, GPU runs show `CUDA0 model buffer size`. With `--usecpu` the log still prints `offloaded 27/27 layers to GPU`, but the buffers are all `CPU`; the `-nocuda` build prints `offloaded 0/27`.
 
 ### Gemini
 
@@ -96,6 +112,17 @@ Answer: During Black Friday, the PressureValve system automatically scaled resou
 With Gemini the index line reads `Indexed 7 chunks (3072-dim embeddings)`, the same three sources come back, and the answer is a longer bulleted summary of the same document.
 
 PressureValve exists only in `examples/chat/docs/sample.txt`, so the answer comes from retrieval, not from the model's training data.
+
+### CPU vs GPU
+
+Every llama.cpp and KoboldCpp setup above, CPU or GPU, produced the output shown. Wall time for `go run ./examples/local_llm` (7 chunks, one answer, compile included), one run each on an AMD Ryzen 9 5950X (16 cores) and an RTX 3080:
+
+| Setup | Wall time |
+|---|---|
+| KoboldCpp, CUDA build, `--gpulayers 99` | 2.4 s |
+| KoboldCpp, CUDA build, `--usecpu` | 5.0 s |
+| KoboldCpp, `-nocuda` build | 4.9 s |
+| llama.cpp, CPU (`--device none`, Homebrew build) | 11.3 s |
 
 ## How it hooks up
 
@@ -175,5 +202,6 @@ The building blocks in `examples/local_llm` avoid both limits.
 | `unknown command 'FT.HYBRID'` or `unknown command 'FT.INFO'` | Redis is older than 8.4 (`FT.INFO` missing means no query engine at all). |
 | `API request failed with status code 503: 503 Service Unavailable` (llama.cpp) | The server is up but still loading the model; wait for `/health` to return 200. |
 | `embeddings endpoint ...: connection refused` | The server isn't running yet, or `EMBED_URL` has the wrong port. |
+| `-ngl 99` makes no difference (llama.cpp) | Your build has no GPU backend: `llama-server --list-devices` lists only `BLAS`/CPU. It runs on CPU; install a CUDA/Vulkan/Metal build for GPU offload. |
 | `couldn't bind HTTP server socket` (llama.cpp) | The port is taken, possibly by a Windows process under WSL. Pick another `--port` and update `CHAT_URL` or `EMBED_URL`. |
 | `HTTP 404` from the chat endpoint (Gemini) | `CHAT_MODEL` names a model your key can't use; check the error message for the suggested model. |
