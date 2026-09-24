@@ -160,7 +160,7 @@ If no document contains any word of the question, this falls back to vector-only
 
 ## Using `raggo.RAG` with Gemini
 
-`raggo.RAG` can also run on Gemini and Redis, because Gemini's embeddings API accepts a `dimensions` parameter that matches `RAG`'s fixed 1536-dimension schema. raggo's built-in `openai` embedder can't send that parameter, so register your own provider and point `RAG` at it:
+`raggo.RAG` can also run on Gemini and Redis. `raggo.RAG` measures the embedding size, so any Gemini dimension works. The registered provider below also asks Gemini for 1536 dimensions, which raggo's built-in `openai` embedder can't request:
 
 ```go
 providers.RegisterEmbedder("gemini", func(cfg map[string]interface{}) (providers.Embedder, error) {
@@ -187,12 +187,9 @@ results, err := r.Query(ctx, "What did the PressureValve system do during Black 
 REDIS_ADDR=localhost:6379 GEMINI_API_KEY=... go test -tags=integration -run TestGeminiRAG -v .
 ```
 
-## Why not `raggo.RAG` with llama.cpp or KoboldCpp?
+## `raggo.RAG` with local models
 
-- `RAG`'s collection schema is fixed at 1536 dimensions (`rag.go`). Most local embedding models output 384–1024 (embeddinggemma-300M: 768), so every insert would be rejected.
-- raggo's built-in LLM calls use gollm's `openai` provider, whose endpoint is fixed at `api.openai.com` in gollm v0.1.1, so they can't reach a local chat server.
-
-The building blocks in `examples/local_llm` avoid both limits.
+`raggo.RAG` can index and search with a local embeddings server: `SetEmbedURL` points it at the server and the index is sized from the model (see the README Quick Start and `examples/redis_quickstart`). What it can't do is answer from a local chat model, because raggo's built-in LLM calls use gollm's `openai` provider, whose endpoint is fixed at `api.openai.com` in gollm v0.1.1. `examples/local_llm` makes that chat call directly.
 
 ## Troubleshooting
 
