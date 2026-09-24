@@ -1,20 +1,33 @@
-# Local RAG with raggo, Redis, and llama.cpp or KoboldCpp
+# RAG with raggo and Redis: llama.cpp, KoboldCpp, or Gemini
 
-raggo parses and chunks your documents, embeds them through a local OpenAI-compatible `/v1/embeddings` endpoint, and stores and retrieves them in Redis with hybrid (BM25 + vector) search. A local chat model then answers from the retrieved chunks. Nothing leaves your machine.
+raggo parses and chunks your documents, embeds them through an OpenAI-compatible `/v1/embeddings` endpoint, and stores and retrieves them in Redis with hybrid (BM25 + vector) search. A chat model then answers from the retrieved chunks. With llama.cpp or KoboldCpp everything runs on your machine; with Gemini the embedding and chat calls go to Google's API.
 
-The complete program is [`examples/local_llm/main.go`](examples/local_llm/main.go).
+The complete program is [`examples/local_llm/main.go`](examples/local_llm/main.go). The same binary works with all three backends; only environment variables change.
 
 ## Requirements
 
 - Go 1.27.1+
 - Redis 8.4+ (for `FT.HYBRID`): `docker run -d --rm -p 6379:6379 --name raggo-redis redis:8.4`
-- One of the servers below, plus an embeddings GGUF and a chat GGUF. The examples use [`ggml-org/embeddinggemma-300M-GGUF`](https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF) (768-dim) and [`ggml-org/gemma-3-1b-it-GGUF`](https://huggingface.co/ggml-org/gemma-3-1b-it-GGUF).
+- One backend:
+  - **llama.cpp or KoboldCpp**, plus an embeddings GGUF and a chat GGUF. The examples use [`ggml-org/embeddinggemma-300M-GGUF`](https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF) (768-dim) and [`ggml-org/gemma-3-1b-it-GGUF`](https://huggingface.co/ggml-org/gemma-3-1b-it-GGUF).
+  - **Gemini**: a Gemini API key.
 
-## Start the model server
+## Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `REDIS_ADDR` | `localhost:6379` | Redis address, or a `redis://user:pass@host:port/db` URL |
+| `EMBED_URL` | `http://localhost:8081/v1/embeddings` | OpenAI-compatible embeddings endpoint |
+| `CHAT_URL` | `http://localhost:8080/v1/chat/completions` | OpenAI-compatible chat endpoint |
+| `API_KEY` | `none` | Sent as `Authorization: Bearer …`; local servers ignore it |
+| `EMBED_MODEL` | `local` | Embeddings model name; local servers ignore it |
+| `CHAT_MODEL` | *(empty, not sent)* | Chat model name; required by hosted APIs such as Gemini |
+
+## Start a backend
 
 ### llama.cpp
 
-A server started with `--embeddings` serves embeddings only, so run two. `-hf` downloads the model on first use:
+A server started with `--embeddings` serves embeddings only, so run two. `-hf` downloads the model on first use, and `-ngl 99` offloads all layers to the GPU:
 
 ```bash
 llama-server -hf ggml-org/embeddinggemma-300M-GGUF --embeddings --pooling mean --port 8081
@@ -26,7 +39,7 @@ export EMBED_URL=http://localhost:8081/v1/embeddings
 export CHAT_URL=http://localhost:8080/v1/chat/completions
 ```
 
-Both servers are ready when `curl localhost:8081/health` and `curl localhost:8080/health` return 200.
+Both are ready when `curl localhost:8081/health` and `curl localhost:8080/health` return 200.
 
 ### KoboldCpp
 
@@ -43,7 +56,21 @@ export EMBED_URL=http://localhost:5001/v1/embeddings
 export CHAT_URL=http://localhost:5001/v1/chat/completions
 ```
 
-It is ready when `curl localhost:5001/v1/models` returns 200. (Tested with the `koboldcpp-linux-x64` v1.121 release on an NVIDIA GPU; the same release also ships a `koboldcpp-linux-x64-nocuda` build.)
+It is ready when `curl localhost:5001/v1/models` returns 200. Tested with the `koboldcpp-linux-x64` v1.121 release on an NVIDIA GPU. Without an NVIDIA GPU, use the `koboldcpp-linux-x64-nocuda` build from the same release.
+
+### Gemini
+
+Gemini serves OpenAI-compatible endpoints, so no server is needed. Unlike the local servers, it requires the key and both model names:
+
+```bash
+export API_KEY=$GEMINI_API_KEY
+export EMBED_URL=https://generativelanguage.googleapis.com/v1beta/openai/embeddings
+export EMBED_MODEL=gemini-embedding-001
+export CHAT_URL=https://generativelanguage.googleapis.com/v1beta/openai/chat/completions
+export CHAT_MODEL=gemini-3.6-flash
+```
+
+`gemini-embedding-001` returns 3072-dimension vectors; the program sizes the Redis index from the model, so nothing else changes.
 
 ## Run
 
@@ -51,11 +78,13 @@ It is ready when `curl localhost:5001/v1/models` returns 200. (Tested with the `
 REDIS_ADDR=localhost:6379 go run ./examples/local_llm -docs examples/chat/docs -q "What did the PressureValve system do during Black Friday?"
 ```
 
-Output with either server and the models above:
+Each run replaces the `local_docs` index in Redis. It only drops the old index after every document has been parsed and embedded, so a wrong `-docs` path or a failing endpoint leaves it intact.
+
+Output with llama.cpp or KoboldCpp and the models above:
 
 ```text
-Indexed 7 chunks (768-dim embeddings)
 Inserting 7 records into collection: local_docs
+Indexed 7 chunks (768-dim embeddings)
 Performing hybrid search in collection local_docs for top 3 results with metric type COSINE
 Sources:
   1.000 {"source":"sample.txt"}
@@ -64,18 +93,20 @@ Sources:
 Answer: During Black Friday, the PressureValve system automatically scaled resources based on incoming traffic patterns and distributed load across multiple servers, successfully maintaining system stability and ensuring zero downtime by dynamically allocating resources and routing requests efficiently.
 ```
 
+With Gemini the index line reads `Indexed 7 chunks (3072-dim embeddings)`, the same three sources come back, and the answer is a longer bulleted summary of the same document.
+
 PressureValve exists only in `examples/chat/docs/sample.txt`, so the answer comes from retrieval, not from the model's training data.
 
 ## How it hooks up
 
-**Embeddings from the local server.** raggo's `openai` embedder works with any OpenAI-compatible server when you set `api_url`. Local servers ignore the model and key, but raggo requires a non-empty key:
+**Embeddings from any OpenAI-compatible endpoint.** raggo's `openai` embedder works with any such server when you set `api_url`. raggo requires a non-empty key even when the server ignores it:
 
 ```go
 embedder, err := raggo.NewEmbedder(
 	raggo.SetEmbedderProvider("openai"),
-	raggo.SetEmbedderModel("local"),
-	raggo.SetEmbedderAPIKey("none"),
-	raggo.SetOption("api_url", embedURL),
+	raggo.SetEmbedderModel(cfg.embedModel),
+	raggo.SetEmbedderAPIKey(cfg.apiKey),
+	raggo.SetOption("api_url", cfg.embedURL),
 )
 ```
 
@@ -98,20 +129,51 @@ results, err := db.HybridSearch(ctx, collection, map[string]raggo.Vector{"Embedd
 
 If no document contains any word of the question, this falls back to vector-only search.
 
-**Answer:** POST the retrieved chunks and the question to `CHAT_URL` (`/v1/chat/completions`) and read `choices[0].message.content`. See `chat` in the example.
+**Answer:** POST the retrieved chunks and the question to `CHAT_URL` (`/v1/chat/completions`) with `Authorization: Bearer $API_KEY` (and `model` when `CHAT_MODEL` is set), then read `choices[0].message.content`. See `chat` in the example.
 
-## Why not `raggo.RAG` or `raggo.SimpleRAG`?
+## Using `raggo.RAG` with Gemini
 
-- `RAG`'s collection schema is fixed at 1536 dimensions. Most local embedding models use 384–1024, so every insert would be rejected.
-- raggo's built-in LLM calls go through gollm v0.1.1, which only targets `api.openai.com`.
+`raggo.RAG` can also run on Gemini and Redis, because Gemini's embeddings API accepts a `dimensions` parameter that matches `RAG`'s fixed 1536-dimension schema. raggo's built-in `openai` embedder can't send that parameter, so register your own provider and point `RAG` at it:
 
-The building blocks above avoid both limits.
+```go
+providers.RegisterEmbedder("gemini", func(cfg map[string]interface{}) (providers.Embedder, error) {
+	apiKey, _ := cfg["api_key"].(string)
+	model, _ := cfg["model"].(string)
+	return geminiEmbedder{apiKey: apiKey, model: model}, nil // POSTs {"model", "input", "dimensions": 1536}
+})
+
+r, err := raggo.NewRAG(
+	raggo.SetProvider("gemini"),
+	raggo.SetModel("gemini-embedding-001"),
+	raggo.SetAPIKey(os.Getenv("GEMINI_API_KEY")),
+	raggo.SetDBType("redis"),
+	raggo.SetDBAddress("localhost:6379"),
+	raggo.SetCollection("docs"),
+)
+err = r.LoadDocuments(ctx, "examples/chat/docs")
+results, err := r.Query(ctx, "What did the PressureValve system do during Black Friday?")
+```
+
+`providers` is `github.com/teilomillet/raggo/rag/providers`. The full `geminiEmbedder`, a retry on HTTP 429/5xx, the chat call, and assertions over hybrid, dense and `Retriever` queries are in [`rag_integration_test.go`](rag_integration_test.go):
+
+```bash
+REDIS_ADDR=localhost:6379 GEMINI_API_KEY=... go test -tags=integration -run TestGeminiRAG -v .
+```
+
+## Why not `raggo.RAG` with llama.cpp or KoboldCpp?
+
+- `RAG`'s collection schema is fixed at 1536 dimensions (`rag.go`). Most local embedding models output 384–1024 (embeddinggemma-300M: 768), so every insert would be rejected.
+- raggo's built-in LLM calls use gollm's `openai` provider, whose endpoint is fixed at `api.openai.com` in gollm v0.1.1, so they can't reach a local chat server.
+
+The building blocks in `examples/local_llm` avoid both limits.
 
 ## Troubleshooting
 
 | Symptom | Cause |
 |---|---|
 | `vector has N dimensions, index expects M` | The collection was created with a different embedding model. The example recreates `local_docs` on every run; in your own code, drop or rename the collection when you change models. |
-| `ERR unknown command 'FT.HYBRID'` | Redis is older than 8.4. |
-| `embeddings endpoint ...: connection refused` | The server is still loading the model; wait for `/health` (llama.cpp) or `/v1/models` (KoboldCpp). |
+| `unknown command 'FT.HYBRID'` or `unknown command 'FT.INFO'` | Redis is older than 8.4 (`FT.INFO` missing means no query engine at all). |
+| `API request failed with status code 503: 503 Service Unavailable` (llama.cpp) | The server is up but still loading the model; wait for `/health` to return 200. |
+| `embeddings endpoint ...: connection refused` | The server isn't running yet, or `EMBED_URL` has the wrong port. |
 | `couldn't bind HTTP server socket` (llama.cpp) | The port is taken, possibly by a Windows process under WSL. Pick another `--port` and update `CHAT_URL` or `EMBED_URL`. |
+| `HTTP 404` from the chat endpoint (Gemini) | `CHAT_MODEL` names a model your key can't use; check the error message for the suggested model. |
