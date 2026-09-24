@@ -75,18 +75,16 @@ cfg.Dimension = 0                                    // 0 = measure from the mod
 cfg.IndexMetric = "COSINE"
 cfg.UseHybrid = true                                 // BM25 on the chunk text + vector KNN, fused by FT.HYBRID
 cfg.TopK = 5
-cfg.MinScore = 0.5                                   // scores are normalized to [0,1]; higher is better
+cfg.MinScore = 0.5                                   // scores are normalized to roughly [0,1]; higher is better
 cfg.ChunkSize = 300
 cfg.ChunkOverlap = 50
-cfg.SearchParams = map[string]interface{}{
-	"combine": "RRF", // or "LINEAR" with "alpha" and "beta" weights
-	"ef":      64,    // HNSW search depth
-}
+cfg.SearchParams["combine"] = "RRF" // or "LINEAR" with "alpha" and "beta" weights
+cfg.SearchParams["ef"] = 64         // HNSW search depth
 
 r, err := raggo.NewRAG(func(c *raggo.RAGConfig) { *c = *cfg })
 ```
 
-The same settings as options:
+The same settings as options (`IndexMetric` has no option; set it on the struct):
 
 ```go
 r, err := raggo.NewRAG(
@@ -98,8 +96,13 @@ r, err := raggo.NewRAG(
 	raggo.SetSearchStrategy("hybrid"),
 	raggo.SetTopK(5),
 	raggo.SetMinScore(0.5),
+	raggo.SetChunkSize(300),
+	raggo.SetChunkOverlap(50),
+	raggo.SetDimension(0),
 )
 ```
+
+`APIKey` defaults to `$OPENAI_API_KEY` and is sent to `EmbedURL`; set it explicitly (as above) when `EmbedURL` isn't OpenAI.
 
 Redis search parameters (`SearchParams`) are checked before any Redis call, even the ones the chosen fusion doesn't use:
 
