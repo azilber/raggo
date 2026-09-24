@@ -26,3 +26,5 @@ data/chromem.db/
 .DS_Store
 
 *.json
+# Local agent plans (contain machine-specific paths)
+docs/superpowers/plans/
