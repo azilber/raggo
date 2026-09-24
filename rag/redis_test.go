@@ -58,6 +58,35 @@ func TestKeyID(t *testing.T) {
 	}
 }
 
+func TestEfRuntime(t *testing.T) {
+	tests := []struct {
+		name    string
+		params  map[string]interface{}
+		want    int
+		wantErr bool
+	}{
+		{name: "absent uses Redis default", params: nil, want: 10},
+		{name: "float64 from JSON config", params: map[string]interface{}{"ef": float64(64)}, want: 64},
+		{name: "fractional is an error", params: map[string]interface{}{"ef": 64.5}, wantErr: true},
+		{name: "zero is an error", params: map[string]interface{}{"ef": 0}, wantErr: true},
+		{name: "above MaxInt32 is an error", params: map[string]interface{}{"ef": 1e12}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := efRuntime(tt.params)
+			if tt.wantErr {
+				if err == nil || !strings.Contains(err.Error(), `"ef"`) {
+					t.Errorf("efRuntime(%v) err = %v, want error naming \"ef\"", tt.params, err)
+				}
+				return
+			}
+			if err != nil || got != tt.want {
+				t.Errorf("efRuntime(%v) = %d, %v; want %d, nil", tt.params, got, err, tt.want)
+			}
+		})
+	}
+}
+
 func TestFloatParam(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -136,13 +165,25 @@ func TestRedisConnectErrorHidesPassword(t *testing.T) {
 	}
 }
 
-// A bad LINEAR weight must fail before any Redis call: this RedisDB was never
-// connected, so reaching Redis would nil-deref instead of returning an error.
-func TestRedisHybridSearchRejectsBadWeightBeforeRedis(t *testing.T) {
-	db, _ := newRedisDB(&Config{})
-	_, err := db.HybridSearch(context.Background(), "docs", map[string]Vector{"Embedding": {1, 0}}, 3, "COSINE",
-		map[string]interface{}{"combine": "LINEAR", "alpha": "0.3"}, nil)
-	if err == nil || !strings.Contains(err.Error(), "alpha") {
-		t.Errorf("err = %v, want error naming alpha", err)
+// Bad params fail before any Redis call (this RedisDB was never connected, so
+// reaching Redis would nil-deref), including weights RRF would never use.
+func TestRedisHybridSearchRejectsBadParamsBeforeRedis(t *testing.T) {
+	tests := []struct {
+		name    string
+		params  map[string]interface{}
+		wantKey string
+	}{
+		{name: "string alpha with LINEAR", params: map[string]interface{}{"combine": "LINEAR", "alpha": "0.3"}, wantKey: "alpha"},
+		{name: "string alpha with RRF (unused)", params: map[string]interface{}{"combine": "RRF", "alpha": "0.3"}, wantKey: "alpha"},
+		{name: "fractional ef", params: map[string]interface{}{"ef": 64.5}, wantKey: `"ef"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, _ := newRedisDB(&Config{})
+			_, err := db.HybridSearch(context.Background(), "docs", map[string]Vector{"Embedding": {1, 0}}, 3, "COSINE", tt.params, nil)
+			if err == nil || !strings.Contains(err.Error(), tt.wantKey) {
+				t.Errorf("err = %v, want error naming %s", err, tt.wantKey)
+			}
+		})
 	}
 }
