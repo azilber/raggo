@@ -32,6 +32,35 @@ func TestValidName(t *testing.T) {
 	}
 }
 
+func TestKeyID(t *testing.T) {
+	tests := []struct {
+		name    string
+		key     string
+		want    int64
+		wantErr bool
+	}{
+		{name: "simple key", key: "docs:42", want: 42},
+		{name: "last colon wins", key: "a:b:7", want: 7},
+		{name: "non-numeric suffix", key: "docs:abc", wantErr: true},
+		{name: "empty suffix", key: "docs:", wantErr: true},
+		{name: "no colon", key: "nocolon", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := keyID(tt.key)
+			if tt.wantErr {
+				if err == nil || !strings.Contains(err.Error(), tt.key) {
+					t.Errorf("keyID(%q) err = %v, want error naming the key", tt.key, err)
+				}
+				return
+			}
+			if err != nil || got != tt.want {
+				t.Errorf("keyID(%q) = %d, %v; want %d, nil", tt.key, got, err, tt.want)
+			}
+		})
+	}
+}
+
 func TestFuseRRF(t *testing.T) {
 	a := []SearchResult{{ID: 1}, {ID: 2}}
 	b := []SearchResult{{ID: 2}, {ID: 3}}
